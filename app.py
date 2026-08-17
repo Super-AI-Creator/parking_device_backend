@@ -122,6 +122,49 @@ def owner_scope() -> int | None:
     return current_user_id()
 
 
+def _valid_manual_pin(pin: str) -> str | None:
+    pin = (pin or "").strip()
+    if not pin:
+        return None
+    if not pin.isdigit() or len(pin) != 6:
+        raise ValueError("Manual PIN must be 6 digits")
+    return pin
+
+
+def _sync_space_keyboard_pin(space: dict, pin: str | None) -> str | None:
+    pin = (pin or "").strip() or None
+    old_pin = (space.get("pin") or "").strip() or None
+    old_id = space.get("keyboardPwdId")
+    client = client_for_space(space)
+    can_talk = client.configured or client.mock_mode
+
+    if old_id and pin != old_pin and can_talk:
+        try:
+            client.delete_keyboard_pin(space["lockId"], old_id)
+        except TTLockError:
+            pass
+        old_id = None
+
+    if not pin:
+        return None
+    if pin == old_pin and old_id:
+        return old_id
+    if not can_talk:
+        return old_id
+
+    try:
+        result = client.add_keyboard_pin(
+            space["lockId"],
+            pin,
+            name=(space.get("name") or "Manual")[:50],
+        )
+        if result.get("success"):
+            return result.get("keyboardPwdId") or old_id
+    except TTLockError:
+        pass
+    return old_id
+
+
 # ─── Public / auth ───────────────────────────────────────────────
 
 
@@ -625,21 +668,29 @@ def post_parking_space():
     denied = ensure_hotel_access(hotel)
     if denied:
         return denied
-    if pin and (not pin.isdigit() or len(pin) < 4):
-        return error("PIN must be at least 4 digits when set manually")
+    if pin:
+        try:
+            pin = _valid_manual_pin(pin)
+        except ValueError as exc:
+            return error(str(exc))
 
     try:
         space = create_space(
             owner_id=owner_id,
             name=name,
             lock_id=lock_id,
-            pin=pin or None,
+            pin=pin,
             enabled=enabled,
             notes=notes,
             hotel_id=hotel["id"],
         )
     except IntegrityError:
         return error("This lock is already assigned, or the PIN is already used at this hotel", 409)
+
+    if pin:
+        keyboard_id = _sync_space_keyboard_pin(space, pin)
+        if keyboard_id != space.get("keyboardPwdId"):
+            space = update_space(space["id"], keyboardPwdId=keyboard_id)
 
     return jsonify({"ok": True, "space": space}), 201
 
@@ -665,10 +716,11 @@ def put_parking_space(space_id: int):
             return error("lockId cannot be empty")
         fields["lockId"] = lock_id
     if "pin" in data:
-        pin = str(data["pin"]).strip()
-        if pin and (not pin.isdigit() or len(pin) < 4):
-            return error("PIN must be at least 4 digits when set")
-        fields["pin"] = pin
+        try:
+            pin = _valid_manual_pin(str(data.get("pin") or ""))
+        except ValueError as exc:
+            return error(str(exc))
+        fields["pin"] = pin or ""
     if "hotelId" in data:
         hotel_pk = data.get("hotelId")
         if not hotel_pk:
@@ -687,6 +739,11 @@ def put_parking_space(space_id: int):
         updated = update_space(space_id, **fields)
     except IntegrityError:
         return error("PIN already exists at this hotel, or this lockId is already assigned", 409)
+
+    if "pin" in fields:
+        keyboard_id = _sync_space_keyboard_pin(space, fields.get("pin") or "")
+        if keyboard_id != updated.get("keyboardPwdId"):
+            updated = update_space(space_id, keyboardPwdId=keyboard_id)
 
     return jsonify({"ok": True, "space": updated})
 
