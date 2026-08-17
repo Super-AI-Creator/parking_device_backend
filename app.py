@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import os
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -21,31 +22,40 @@ from auth import (
     require_manager,
     require_roles,
 )
+from beds24 import Beds24Error
 from models import (
     IntegrityError,
     add_log,
     authenticate_user,
+    clear_hotel_ttlock,
     clear_logs,
+    clear_pms_credentials,
     clear_ttlock_credentials,
     create_manager,
     create_space,
     delete_space,
     delete_user,
     get_dashboard_stats,
+    get_hotel,
     get_space,
     get_space_by_pin,
     get_user,
     init_db,
+    list_bookings,
+    list_hotels,
     list_logs,
     list_spaces,
     list_users,
+    set_hotel_ttlock,
+    set_pms_credentials,
     set_ttlock_credentials,
     update_space,
     update_user_profile,
     update_user_status,
 )
 from rate_limit import AttemptLimiter
-from ttlock_service import TTLockClient, TTLockError, client_for_owner
+from scheduler import start_scheduler
+from ttlock_service import TTLockClient, TTLockError, client_for_hotel, client_for_owner, client_for_space
 
 app = Flask(__name__, static_folder=None)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -61,6 +71,8 @@ CORS(app, origins=config.CORS_ORIGINS, supports_credentials=True)
 
 init_db()
 unlock_limiter = AttemptLimiter(config.UNLOCK_MAX_ATTEMPTS, config.UNLOCK_WINDOW_SECONDS)
+if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or not config.DEBUG:
+    start_scheduler()
 
 
 def error(message: str, status: int = 400, **extra):
@@ -88,6 +100,17 @@ def ensure_space_access(space: dict | None):
     if role == ROLE_ADMIN:
         return None
     if role == ROLE_MANAGER and space.get("ownerId") == current_user_id():
+        return None
+    return error("Permission denied", 403)
+
+
+def ensure_hotel_access(hotel: dict | None):
+    if hotel is None:
+        return error("Hotel not found", 404)
+    role = current_role()
+    if role == ROLE_ADMIN:
+        return None
+    if role == ROLE_MANAGER and hotel.get("ownerId") == current_user_id():
         return None
     return error("Permission denied", 403)
 
@@ -312,6 +335,202 @@ def get_ttlock_credentials():
     )
 
 
+# ─── PMS (Beds24) ────────────────────────────────────────────────
+
+
+@app.get("/api/me/pms")
+@require_manager
+def get_pms_credentials():
+    user = session_user()
+    if user is None:
+        return error("User not found", 404)
+    return jsonify(
+        {
+            "ok": True,
+            "pmsConfigured": user.get("pmsConfigured", False),
+            "pmsRefreshConfigured": user.get("pmsRefreshConfigured", False),
+            "pmsTokenPreview": user.get("pmsTokenPreview") or "",
+        }
+    )
+
+
+@app.put("/api/me/pms")
+@require_manager
+def update_pms_credentials():
+    import beds24
+    from booking_sync import sync_hotels_for_user
+
+    data = request.get_json(silent=True) or {}
+    if data.get("clear"):
+        user = clear_pms_credentials(current_user_id())
+        return jsonify({"ok": True, "user": user, "message": "PMS credentials cleared"})
+
+    invite_code = str(data.get("inviteCode") or data.get("code") or "").strip()
+    token = str(data.get("token") or data.get("accessToken") or "").strip()
+    refresh_token = str(data.get("refreshToken") or "").strip()
+
+    if invite_code:
+        try:
+            setup = beds24.setup_from_invite(invite_code)
+        except Beds24Error as exc:
+            return error(str(exc), 400, beds24=exc.response)
+        token = setup["token"]
+        refresh_token = setup.get("refreshToken") or refresh_token
+
+    existing = get_user(current_user_id(), include_secrets=True)
+    if not refresh_token and existing:
+        refresh_token = (existing.get("pmsRefreshToken") or "").strip()
+
+    if not token:
+        return error("Beds24 access token or invite code is required")
+    if not refresh_token:
+        return error(
+            "A Beds24 refresh token (or invite code) is required so ParkAccess can renew the access token automatically."
+        )
+
+    try:
+        beds24.get_properties(token)
+    except Beds24Error as exc:
+        return error(f"Beds24 token failed: {exc}", 400, beds24=exc.response)
+
+    user = set_pms_credentials(current_user_id(), token, refresh_token)
+    secret_user = get_user(current_user_id(), include_secrets=True)
+    hotels = []
+    try:
+        hotels = sync_hotels_for_user(secret_user)
+    except Beds24Error as exc:
+        return jsonify(
+            {
+                "ok": True,
+                "user": user,
+                "hotels": [],
+                "message": f"PMS connected, but hotel sync failed: {exc}",
+            }
+        )
+
+    return jsonify(
+        {
+            "ok": True,
+            "user": user,
+            "hotels": hotels,
+            "count": len(hotels),
+            "message": f"PMS connected. Imported {len(hotels)} hotel(s). Bookings will sync every minute in the background.",
+        }
+    )
+
+
+@app.post("/api/me/pms/sync-hotels")
+@require_manager
+def sync_pms_hotels():
+    from booking_sync import sync_hotels_for_user
+
+    user = get_user(current_user_id(), include_secrets=True)
+    if not user or not user.get("pmsConfigured"):
+        return error("Save a Beds24 access token first", 400)
+    try:
+        hotels = sync_hotels_for_user(user)
+    except Beds24Error as exc:
+        return error(str(exc), 502, beds24=exc.response)
+    return jsonify({"ok": True, "hotels": hotels, "count": len(hotels)})
+
+
+@app.post("/api/me/pms/sync-bookings")
+@require_manager
+def sync_pms_bookings():
+    from booking_sync import sync_bookings_for_user, sync_hotels_for_user
+
+    user = get_user(current_user_id(), include_secrets=True)
+    if not user or not user.get("pmsConfigured"):
+        return error("Save a Beds24 access token first", 400)
+    try:
+        sync_hotels_for_user(user)
+        result = sync_bookings_for_user(user)
+    except Beds24Error as exc:
+        return error(str(exc), 502)
+    return jsonify({"ok": True, **result})
+
+
+# ─── Hotels ──────────────────────────────────────────────────────
+
+
+@app.get("/api/hotels")
+@require_manager
+def get_hotels():
+    return jsonify({"ok": True, "hotels": list_hotels(owner_id=owner_scope())})
+
+
+@app.put("/api/hotels/<int:hotel_pk>/ttlock")
+@require_manager
+def update_hotel_ttlock(hotel_pk: int):
+    hotel = get_hotel(hotel_pk)
+    denied = ensure_hotel_access(hotel)
+    if denied:
+        return denied
+
+    data = request.get_json(silent=True) or {}
+    if data.get("clear"):
+        updated = clear_hotel_ttlock(hotel_pk)
+        return jsonify({"ok": True, "hotel": updated, "message": "Hotel TTLock credentials cleared"})
+
+    username = str(data.get("username") or data.get("clientId") or "").strip()
+    password = str(data.get("password") or "")
+    if not username or not password:
+        return error("TTLock username and password are required")
+
+    client = TTLockClient(username=username, password=password)
+    try:
+        verify = client.verify_credentials()
+    except TTLockError as exc:
+        return error(f"TTLock login failed: {exc}", 400, ttlock=exc.response)
+
+    updated = set_hotel_ttlock(hotel_pk, username, password)
+    return jsonify({"ok": True, "hotel": updated, "verify": verify})
+
+
+@app.get("/api/hotels/<int:hotel_pk>/gateways")
+@require_manager
+def get_hotel_gateways(hotel_pk: int):
+    hotel = get_hotel(hotel_pk, include_secrets=True)
+    denied = ensure_hotel_access(hotel)
+    if denied:
+        return denied
+
+    client = client_for_hotel(hotel)
+    if not client.configured and not client.mock_mode:
+        return error("Save TTLock username and password for this hotel first.", 400)
+
+    include_locks = request.args.get("includeLocks", "1") != "0"
+    try:
+        result = client.list_gateways(include_locks=include_locks)
+    except TTLockError as exc:
+        add_log(
+            action="list_gateways",
+            owner_id=hotel.get("ownerId"),
+            actor_user_id=current_user_id(),
+            success=False,
+            message=str(exc),
+            response_payload=exc.response,
+        )
+        return error(str(exc), 502, ttlock=exc.response)
+
+    add_log(
+        action="list_gateways",
+        owner_id=hotel.get("ownerId"),
+        actor_user_id=current_user_id(),
+        success=True,
+        message=f"Hotel {hotel.get('hotelId')}: {len(result['gateways'])} gateway(s)",
+        response_payload={"count": len(result["gateways"]), "hotelId": hotel.get("hotelId")},
+    )
+    return jsonify({"ok": True, "mock": result["mock"], "hotel": hotel, "gateways": result["gateways"]})
+
+
+@app.get("/api/bookings")
+@require_manager
+def get_bookings():
+    hotel_id = request.args.get("hotelId", type=int)
+    return jsonify({"ok": True, "bookings": list_bookings(owner_id=owner_scope(), hotel_id=hotel_id)})
+
+
 # ─── Dashboard / gateways / spaces ───────────────────────────────
 
 
@@ -320,30 +539,19 @@ def get_ttlock_credentials():
 def dashboard():
     scope = owner_scope()
     stats = get_dashboard_stats(owner_id=scope)
-    gateway_summary = {"count": 0, "online": 0, "configured": False}
-
-    me = get_user(current_user_id(), include_secrets=True)
-    target_id = current_user_id() if current_role() == ROLE_MANAGER else current_user_id()
-    if me and me.get("ttlockConfigured"):
-        client = client_for_owner(target_id)
-        gateway_summary["configured"] = client.configured
-        if client.configured or client.mock_mode:
-            try:
-                result = client.list_gateways(include_locks=False)
-                gateways = result.get("gateways") or []
-                gateway_summary.update(
-                    {
-                        "count": len(gateways),
-                        "online": sum(1 for g in gateways if g.get("isOnline")),
-                        "mock": result.get("mock", False),
-                    }
-                )
-            except TTLockError:
-                gateway_summary["error"] = "Unable to reach TTLock gateway list"
-    elif current_role() == ROLE_ADMIN:
-        gateway_summary["note"] = "Save TTLock credentials under My TTLock to browse gateways as admin."
-
-    return jsonify({"ok": True, "stats": stats, "gateways": gateway_summary})
+    hotels = list_hotels(owner_id=scope)
+    configured = sum(1 for hotel in hotels if hotel.get("ttlockConfigured"))
+    return jsonify(
+        {
+            "ok": True,
+            "stats": stats,
+            "gateways": {
+                "configured": configured > 0,
+                "hotelsWithTtlock": configured,
+                "hotelCount": len(hotels),
+            },
+        }
+    )
 
 
 @app.get("/api/gateways")
@@ -388,7 +596,8 @@ def get_gateways():
 @app.get("/api/parking-spaces")
 @require_manager
 def get_parking_spaces():
-    return jsonify({"ok": True, "spaces": list_spaces(owner_id=owner_scope())})
+    hotel_id = request.args.get("hotelId", type=int)
+    return jsonify({"ok": True, "spaces": list_spaces(owner_id=owner_scope(), hotel_id=hotel_id)})
 
 
 @app.post("/api/parking-spaces")
@@ -400,6 +609,7 @@ def post_parking_space():
     pin = str(data.get("pin", "")).strip()
     notes = str(data.get("notes", "")).strip()
     enabled = bool(data.get("enabled", True))
+    hotel_pk = data.get("hotelId")
 
     owner_id = current_user_id()
     if current_role() == ROLE_ADMIN and data.get("ownerId"):
@@ -409,20 +619,27 @@ def post_parking_space():
         return error("Name is required")
     if not lock_id:
         return error("TTLock lockId is required")
-    if not pin or not pin.isdigit() or len(pin) < 4:
-        return error("PIN must be at least 4 digits")
+    if not hotel_pk:
+        return error("Select a hotel before assigning a parking lock")
+    hotel = get_hotel(int(hotel_pk))
+    denied = ensure_hotel_access(hotel)
+    if denied:
+        return denied
+    if pin and (not pin.isdigit() or len(pin) < 4):
+        return error("PIN must be at least 4 digits when set manually")
 
     try:
         space = create_space(
             owner_id=owner_id,
             name=name,
             lock_id=lock_id,
-            pin=pin,
+            pin=pin or None,
             enabled=enabled,
             notes=notes,
+            hotel_id=hotel["id"],
         )
     except IntegrityError:
-        return error("PIN already exists, or this lockId is already assigned to you", 409)
+        return error("This lock is already assigned, or the PIN is already used at this hotel", 409)
 
     return jsonify({"ok": True, "space": space}), 201
 
@@ -449,9 +666,18 @@ def put_parking_space(space_id: int):
         fields["lockId"] = lock_id
     if "pin" in data:
         pin = str(data["pin"]).strip()
-        if not pin or not pin.isdigit() or len(pin) < 4:
-            return error("PIN must be at least 4 digits")
+        if pin and (not pin.isdigit() or len(pin) < 4):
+            return error("PIN must be at least 4 digits when set")
         fields["pin"] = pin
+    if "hotelId" in data:
+        hotel_pk = data.get("hotelId")
+        if not hotel_pk:
+            return error("Hotel is required")
+        hotel = get_hotel(int(hotel_pk))
+        denied = ensure_hotel_access(hotel)
+        if denied:
+            return denied
+        fields["hotelId"] = hotel["id"]
     if "enabled" in data:
         fields["enabled"] = bool(data["enabled"])
     if "notes" in data:
@@ -460,7 +686,7 @@ def put_parking_space(space_id: int):
     try:
         updated = update_space(space_id, **fields)
     except IntegrityError:
-        return error("PIN already exists, or this lockId is already assigned", 409)
+        return error("PIN already exists at this hotel, or this lockId is already assigned", 409)
 
     return jsonify({"ok": True, "space": updated})
 
@@ -478,6 +704,7 @@ def remove_parking_space(space_id: int):
 
 def _pin_command(action: str):
     data = request.get_json(silent=True) or {}
+    hotel_id = str(data.get("hotelId") or data.get("hotel_id") or "").strip()
     pin = str(data.get("pin", "")).strip()
     key = f"{client_key()}:{action}"
 
@@ -485,16 +712,20 @@ def _pin_command(action: str):
         retry = unlock_limiter.retry_after_seconds(key)
         return error(f"Too many attempts. Try again in {retry}s.", 429, retryAfter=retry)
 
-    if not pin or not pin.isdigit():
+    if not hotel_id:
         unlock_limiter.register_failure(key)
-        add_log(action=f"{action}_pin", success=False, message="Invalid PIN format")
-        return error("Enter a valid numeric PIN")
+        add_log(action=f"{action}_pin", success=False, message="Missing hotel ID")
+        return error("Enter the hotel ID")
+    if not pin or not pin.isdigit() or len(pin) != 6:
+        unlock_limiter.register_failure(key)
+        add_log(action=f"{action}_pin", pin=pin, success=False, message="Invalid PIN format")
+        return error("Enter the 6-digit parking PIN")
 
-    space = get_space_by_pin(pin)
+    space = get_space_by_pin(pin, hotel_public_id=hotel_id)
     if space is None:
         unlock_limiter.register_failure(key)
-        add_log(action=f"{action}_pin", pin=pin, success=False, message="PIN not found")
-        return error("Invalid PIN", 404)
+        add_log(action=f"{action}_pin", pin=pin, success=False, message="Hotel ID or PIN not found")
+        return error("Invalid hotel ID or PIN", 404)
 
     if not space["enabled"]:
         unlock_limiter.register_failure(key)
@@ -511,7 +742,7 @@ def _pin_command(action: str):
         return error("This parking space is currently unavailable", 403)
 
     owner_id = space.get("ownerId")
-    client = client_for_owner(owner_id) if owner_id else TTLockClient()
+    client = client_for_space(space)
     try:
         result = client.unlock(space["lockId"]) if action == "unlock" else client.lock(space["lockId"])
     except TTLockError as exc:
@@ -548,6 +779,7 @@ def _pin_command(action: str):
                 "ok": True,
                 "message": "Barrier opened" if action == "unlock" else "Barrier locked",
                 "spaceName": space["name"],
+                "hotelId": space.get("hotelPublicId") or hotel_id,
                 "action": action,
             }
         )
@@ -557,13 +789,13 @@ def _pin_command(action: str):
 
 @app.post("/api/unlock")
 def unlock_by_pin():
-    """Customer flow: PIN → open."""
+    """Customer flow: hotel ID + 6-digit PIN → open."""
     return _pin_command("unlock")
 
 
 @app.post("/api/lock")
 def lock_by_pin():
-    """Customer flow: PIN → lock/raise."""
+    """Customer flow: hotel ID + 6-digit PIN → lock."""
     return _pin_command("lock")
 
 
@@ -580,7 +812,7 @@ def admin_space_command(space_id: int, action: str):
     if denied:
         return denied
 
-    client = client_for_owner(space["ownerId"]) if space.get("ownerId") else TTLockClient()
+    client = client_for_space(space)
     try:
         result = client.unlock(space["lockId"]) if action == "unlock" else client.lock(space["lockId"])
     except TTLockError as exc:

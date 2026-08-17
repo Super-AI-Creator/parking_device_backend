@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS users (
   company_name         VARCHAR(190) NOT NULL DEFAULT '',
   ttlock_username      VARCHAR(190) NOT NULL DEFAULT '',
   ttlock_password_enc  TEXT         NOT NULL,
+  pms_token            VARCHAR(512) NOT NULL DEFAULT '',
+  pms_refresh_token    VARCHAR(512) NOT NULL DEFAULT '',
+  pms_token_refreshed_at DATETIME(0) NULL,
   created_at           DATETIME(0)  NOT NULL,
   updated_at           DATETIME(0)  NOT NULL,
   approved_at          DATETIME(0)  NULL,
@@ -40,30 +43,92 @@ CREATE TABLE IF NOT EXISTS users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------
+-- hotels (Beds24 properties, one TTLock account per hotel)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS hotels (
+  id                   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  owner_id             BIGINT UNSIGNED NOT NULL,
+  hotel_id             VARCHAR(64)  NOT NULL,
+  name                 VARCHAR(190) NOT NULL DEFAULT '',
+  check_in_start       VARCHAR(16)  NOT NULL DEFAULT '14:00',
+  check_out_end        VARCHAR(16)  NOT NULL DEFAULT '10:00',
+  ttlock_username      VARCHAR(190) NOT NULL DEFAULT '',
+  ttlock_password_enc  TEXT         NOT NULL,
+  created_at           DATETIME(0)  NOT NULL,
+  updated_at           DATETIME(0)  NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_hotels_owner_hotel (owner_id, hotel_id),
+  KEY idx_hotels_hotel_id (hotel_id),
+  CONSTRAINT fk_hotels_owner
+    FOREIGN KEY (owner_id) REFERENCES users (id)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
 -- parking_spaces
--- pin is unique across the platform (customer keypad)
+-- PIN is unique per hotel (customer keypad uses hotel ID + PIN)
 -- lock_id is unique per owner (manager)
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS parking_spaces (
-  id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  owner_id    BIGINT UNSIGNED NULL,
-  name        VARCHAR(120) NOT NULL,
-  lock_id     VARCHAR(64)  NOT NULL,
-  pin         VARCHAR(32)  NOT NULL,
-  enabled     TINYINT(1)   NOT NULL DEFAULT 1,
-  notes       VARCHAR(500) NOT NULL DEFAULT '',
-  created_at  DATETIME(0)  NOT NULL,
-  updated_at  DATETIME(0)  NOT NULL,
+  id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  owner_id         BIGINT UNSIGNED NULL,
+  hotel_id         BIGINT UNSIGNED NULL,
+  name             VARCHAR(120) NOT NULL,
+  lock_id          VARCHAR(64)  NOT NULL,
+  pin              VARCHAR(32)  NULL,
+  booking_id       VARCHAR(64)  NULL,
+  keyboard_pwd_id  VARCHAR(64)  NULL,
+  enabled          TINYINT(1)   NOT NULL DEFAULT 1,
+  notes            VARCHAR(500) NOT NULL DEFAULT '',
+  created_at       DATETIME(0)  NOT NULL,
+  updated_at       DATETIME(0)  NOT NULL,
 
   PRIMARY KEY (id),
-  UNIQUE KEY uq_parking_spaces_pin (pin),
+  UNIQUE KEY uq_parking_spaces_hotel_pin (hotel_id, pin),
   UNIQUE KEY uq_parking_spaces_owner_lock (owner_id, lock_id),
   KEY idx_parking_spaces_owner (owner_id),
-  KEY idx_parking_spaces_enabled (enabled),
+  KEY idx_parking_spaces_hotel (hotel_id),
+  KEY idx_parking_spaces_booking (booking_id),
 
   CONSTRAINT fk_parking_spaces_owner
     FOREIGN KEY (owner_id) REFERENCES users (id)
-    ON DELETE CASCADE
+    ON DELETE CASCADE,
+  CONSTRAINT fk_parking_spaces_hotel
+    FOREIGN KEY (hotel_id) REFERENCES hotels (id)
+    ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- bookings (Beds24 reservations mapped to parking PINs)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bookings (
+  id                 BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  owner_id           BIGINT UNSIGNED NOT NULL,
+  hotel_id           BIGINT UNSIGNED NOT NULL,
+  booking_id         VARCHAR(64)  NOT NULL,
+  guest_name         VARCHAR(190) NOT NULL DEFAULT '',
+  arrival            VARCHAR(32)  NULL,
+  departure          VARCHAR(32)  NULL,
+  status             VARCHAR(32)  NOT NULL DEFAULT 'active',
+  pin                VARCHAR(32)  NULL,
+  parking_space_id   BIGINT UNSIGNED NULL,
+  keyboard_pwd_id    VARCHAR(64)  NULL,
+  raw_payload        JSON         NULL,
+  created_at         DATETIME(0)  NOT NULL,
+  updated_at         DATETIME(0)  NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_bookings_owner_booking (owner_id, booking_id),
+  KEY idx_bookings_hotel (hotel_id),
+  KEY idx_bookings_status (status),
+  CONSTRAINT fk_bookings_owner
+    FOREIGN KEY (owner_id) REFERENCES users (id)
+    ON DELETE CASCADE,
+  CONSTRAINT fk_bookings_hotel
+    FOREIGN KEY (hotel_id) REFERENCES hotels (id)
+    ON DELETE CASCADE,
+  CONSTRAINT fk_bookings_space
+    FOREIGN KEY (parking_space_id) REFERENCES parking_spaces (id)
+    ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------

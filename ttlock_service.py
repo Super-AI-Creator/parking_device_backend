@@ -261,6 +261,45 @@ class TTLockClient:
     def lock(self, lock_id: str | int) -> dict[str, Any]:
         return self._lock_command(lock_id, "lock")
 
+    def add_keyboard_pin(
+        self,
+        lock_id: str | int,
+        pin: str,
+        *,
+        name: str = "ParkAccess",
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        extra = {
+            "lockId": lock_id,
+            "keyboardPwd": pin,
+            "keyboardPwdName": name[:50],
+            "addType": 2,
+            "startDate": start_ms or now_ms,
+            "endDate": end_ms or (now_ms + 1000 * 60 * 60 * 24 * 365),
+        }
+        if self.mock_mode:
+            return {"success": True, "mock": True, "keyboardPwdId": f"mock-{pin}", "response": extra}
+        data = self._api_post("/v3/keyboardPwd/add", extra, timeout=45)
+        pwd_id = data.get("keyboardPwdId")
+        success = bool(pwd_id) or data.get("errcode") in (0, None, -3007)
+        return {
+            "success": success,
+            "mock": False,
+            "keyboardPwdId": str(pwd_id) if pwd_id else None,
+            "message": data.get("errmsg") or data.get("description") or "",
+            "response": data,
+        }
+
+    def delete_keyboard_pin(self, lock_id: str | int, keyboard_pwd_id: str | int) -> dict[str, Any]:
+        if self.mock_mode:
+            return {"success": True, "mock": True}
+        extra = {"lockId": lock_id, "keyboardPwdId": keyboard_pwd_id, "deleteType": 2}
+        data = self._api_post("/v3/keyboardPwd/delete", extra, timeout=45)
+        success = data.get("errcode") in (0, None)
+        return {"success": success, "mock": False, "response": data, "message": data.get("errmsg") or ""}
+
 
 def client_for_owner(owner_id: int) -> TTLockClient:
     from models import get_user
@@ -269,3 +308,21 @@ def client_for_owner(owner_id: int) -> TTLockClient:
     if user is None:
         return TTLockClient()
     return TTLockClient.for_manager(user)
+
+
+def client_for_hotel(hotel: dict[str, Any]) -> TTLockClient:
+    return TTLockClient(
+        username=hotel.get("ttlockUsername") or "",
+        password=hotel.get("ttlockPassword") or "",
+    )
+
+
+def client_for_space(space: dict[str, Any]) -> TTLockClient:
+    from models import get_hotel
+
+    if space.get("hotelId"):
+        hotel = get_hotel(space["hotelId"], include_secrets=True)
+        if hotel and hotel.get("ttlockConfigured"):
+            return client_for_hotel(hotel)
+    owner_id = space.get("ownerId")
+    return client_for_owner(owner_id) if owner_id else TTLockClient()
