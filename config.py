@@ -13,7 +13,7 @@ SECRET_KEY = os.getenv("SECRET_KEY", "").strip() or secrets.token_hex(32)
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin123"
 
-DEBUG = os.getenv("FLASK_ENV", "development").strip().lower() == "development"
+DEBUG = os.getenv("FLASK_ENV", "production").strip().lower() == "development"
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", "5000"))
 
@@ -32,12 +32,24 @@ UNLOCK_MAX_ATTEMPTS = 8
 UNLOCK_WINDOW_SECONDS = 300
 
 CORS_ORIGINS = [
-    origin.strip()
+    origin.strip().rstrip("/")
     for origin in os.getenv(
         "CORS_ORIGINS",
         "http://localhost:5173,http://127.0.0.1:5173",
     ).split(",")
     if origin.strip()
 ]
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+if FRONTEND_URL and FRONTEND_URL not in CORS_ORIGINS:
+    CORS_ORIGINS.append(FRONTEND_URL)
+
+# Cross-site cookies (static frontend + API on different DigitalOcean URLs)
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true" if not DEBUG else "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "None" if not DEBUG else "Lax")
 
 FRONTEND_DIST = BASE_DIR.parent / "frontend" / "dist"

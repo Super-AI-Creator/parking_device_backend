@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import config
 from auth import (
@@ -47,12 +48,13 @@ from rate_limit import AttemptLimiter
 from ttlock_service import TTLockClient, TTLockError, client_for_owner
 
 app = Flask(__name__, static_folder=None)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.secret_key = config.SECRET_KEY
 app.permanent_session_lifetime = timedelta(days=7)
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=False,
+    SESSION_COOKIE_SAMESITE=config.COOKIE_SAMESITE,
+    SESSION_COOKIE_SECURE=config.COOKIE_SECURE,
 )
 
 CORS(app, origins=config.CORS_ORIGINS, supports_credentials=True)
