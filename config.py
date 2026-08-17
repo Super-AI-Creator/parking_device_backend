@@ -22,6 +22,12 @@ MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "").strip()
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "parkaccess").strip() or "parkaccess"
+# DigitalOcean managed MySQL (port 25060) requires SSL
+MYSQL_SSL = os.getenv("MYSQL_SSL", "true" if MYSQL_PORT == 25060 else "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 TTLOCK_CLIENT_ID = os.getenv("TTLOCK_CLIENT_ID", "").strip().strip('"').strip("'")
 TTLOCK_CLIENT_SECRET = os.getenv("TTLOCK_CLIENT_SECRET", "").strip().strip('"').strip("'")

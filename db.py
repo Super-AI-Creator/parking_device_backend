@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import ssl
 from contextlib import contextmanager
 
 import pymysql
@@ -32,6 +33,11 @@ def _connect(*, with_database: bool = True):
         "cursorclass": DictCursor,
         "autocommit": False,
     }
+    if config.MYSQL_SSL:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        kwargs["ssl"] = ctx
     if with_database:
         kwargs["database"] = config.MYSQL_DATABASE
     return pymysql.connect(**kwargs)
