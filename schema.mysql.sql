@@ -76,6 +76,14 @@ CREATE TABLE IF NOT EXISTS parking_spaces (
   name             VARCHAR(120) NOT NULL,
   lock_id          VARCHAR(64)  NOT NULL,
   pin              VARCHAR(32)  NULL,
+  -- Unique only when a PIN is set; multiple free (NULL) locks per hotel are allowed.
+  pin_slot         VARCHAR(96)
+                   GENERATED ALWAYS AS (
+                     CASE
+                       WHEN pin IS NULL OR pin = '' THEN NULL
+                       ELSE CONCAT(IFNULL(hotel_id, 0), ':', pin)
+                     END
+                   ) STORED,
   booking_id       VARCHAR(64)  NULL,
   keyboard_pwd_id  VARCHAR(64)  NULL,
   enabled          TINYINT(1)   NOT NULL DEFAULT 1,
@@ -84,8 +92,8 @@ CREATE TABLE IF NOT EXISTS parking_spaces (
   updated_at       DATETIME(0)  NOT NULL,
 
   PRIMARY KEY (id),
-  UNIQUE KEY uq_parking_spaces_hotel_pin (hotel_id, pin),
   UNIQUE KEY uq_parking_spaces_owner_lock (owner_id, lock_id),
+  UNIQUE KEY uq_parking_spaces_pin_slot (pin_slot),
   KEY idx_parking_spaces_owner (owner_id),
   KEY idx_parking_spaces_hotel (hotel_id),
   KEY idx_parking_spaces_booking (booking_id),

@@ -380,9 +380,13 @@ def update_space(space_id: int, **fields: Any) -> dict[str, Any] | None:
 
     name = fields.get("name", existing["name"])
     lock_id = fields.get("lockId", existing["lockId"])
-    pin = fields.get("pin", existing["pin"])
-    if pin == "":
-        pin = None
+    if "pin" in fields:
+        pin = fields.get("pin")
+        pin = str(pin).strip() if pin is not None and str(pin).strip() else None
+    else:
+        pin = existing["pin"] or None
+        if pin == "":
+            pin = None
     hotel_id = fields.get("hotelId", existing.get("hotelId"))
     booking_id = fields.get("bookingId", existing.get("bookingId"))
     keyboard_pwd_id = fields.get("keyboardPwdId", existing.get("keyboardPwdId"))
@@ -415,9 +419,16 @@ def update_space(space_id: int, **fields: Any) -> dict[str, Any] | None:
 
 
 def delete_space(space_id: int) -> bool:
-    with get_cursor() as cur:
-        cur.execute("DELETE FROM parking_spaces WHERE id = %s", (space_id,))
-        return cur.rowcount > 0
+    """Do not remove the row. Freeing a lock must leave it Available for the next booking."""
+    space = get_space(space_id)
+    if space is None:
+        return False
+    update_space(space_id, pin=None, bookingId=None, keyboardPwdId=None)
+    return True
+
+
+def clear_space_pin(space_id: int) -> dict[str, Any] | None:
+    return update_space(space_id, pin=None, bookingId=None, keyboardPwdId=None)
 
 
 def add_log(
@@ -807,6 +818,23 @@ def clear_hotel_ttlock(hotel_pk: int) -> dict[str, Any] | None:
     return get_hotel(hotel_pk)
 
 
+def get_space_by_owner_lock(owner_id: int, lock_id: str) -> dict[str, Any] | None:
+    lock_id = str(lock_id or "").strip()
+    with get_cursor() as cur:
+        cur.execute(
+            SPACE_SELECT + " WHERE s.owner_id = %s AND s.lock_id = %s",
+            (owner_id, lock_id),
+        )
+        row = cur.fetchone()
+        if row is None and lock_id:
+            cur.execute(
+                SPACE_SELECT + " WHERE s.owner_id = %s AND REPLACE(s.lock_id, ' ', '') = %s",
+                (owner_id, lock_id),
+            )
+            row = cur.fetchone()
+    return row_to_space(row)
+
+
 def find_available_space(hotel_pk: int) -> dict[str, Any] | None:
     with get_cursor() as cur:
         cur.execute(
@@ -954,5 +982,18 @@ def list_active_bookings_for_owner(owner_id: int) -> list[dict[str, Any]]:
             BOOKING_SELECT + " WHERE b.owner_id = %s AND b.status = 'active'",
             (owner_id,),
         )
+        rows = cur.fetchall()
+    return [row_to_booking(row) for row in rows]
+
+
+def list_unassigned_bookings_for_owner(owner_id: int, hotel_id: int | None = None) -> list[dict[str, Any]]:
+    query = BOOKING_SELECT + " WHERE b.owner_id = %s AND b.status = 'unassigned'"
+    params: list[Any] = [owner_id]
+    if hotel_id is not None:
+        query += " AND b.hotel_id = %s"
+        params.append(hotel_id)
+    query += " ORDER BY b.id ASC"
+    with get_cursor() as cur:
+        cur.execute(query, params)
         rows = cur.fetchall()
     return [row_to_booking(row) for row in rows]

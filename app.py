@@ -33,8 +33,8 @@ from models import (
     clear_ttlock_credentials,
     create_manager,
     create_space,
-    delete_space,
     delete_user,
+    get_booking_by_pms_id,
     get_dashboard_stats,
     get_hotel,
     get_space,
@@ -52,6 +52,7 @@ from models import (
     update_space,
     update_user_profile,
     update_user_status,
+    upsert_booking,
 )
 from rate_limit import AttemptLimiter
 from scheduler import start_scheduler
@@ -480,13 +481,14 @@ def sync_pms_hotels():
 @app.post("/api/me/pms/sync-bookings")
 @require_manager
 def sync_pms_bookings():
-    from booking_sync import sync_bookings_for_user, sync_hotels_for_user
+    from booking_sync import sync_bookings_for_user, sync_hotels_for_user, sync_locks_for_user
 
     user = get_user(current_user_id(), include_secrets=True)
     if not user or not user.get("pmsConfigured"):
         return error("Save a Beds24 access token first", 400)
     try:
         sync_hotels_for_user(user)
+        sync_locks_for_user(user)
         result = sync_bookings_for_user(user)
     except Beds24Error as exc:
         return error(str(exc), 502)
@@ -527,7 +529,21 @@ def update_hotel_ttlock(hotel_pk: int):
         return error(f"TTLock login failed: {exc}", 400, ttlock=exc.response)
 
     updated = set_hotel_ttlock(hotel_pk, username, password)
-    return jsonify({"ok": True, "hotel": updated, "verify": verify})
+    from booking_sync import sync_locks_for_hotel
+
+    lock_sync = sync_locks_for_hotel(updated)
+    return jsonify(
+        {
+            "ok": True,
+            "hotel": get_hotel(hotel_pk),
+            "verify": verify,
+            "lockSync": lock_sync,
+            "message": (
+                f"TTLock connected. Auto-imported {lock_sync.get('added', 0)} parking lock(s); "
+                f"{lock_sync.get('count', 0)} total for this hotel."
+            ),
+        }
+    )
 
 
 @app.get("/api/hotels/<int:hotel_pk>/gateways")
@@ -564,7 +580,21 @@ def get_hotel_gateways(hotel_pk: int):
         message=f"Hotel {hotel.get('hotelId')}: {len(result['gateways'])} gateway(s)",
         response_payload={"count": len(result["gateways"]), "hotelId": hotel.get("hotelId")},
     )
-    return jsonify({"ok": True, "mock": result["mock"], "hotel": hotel, "gateways": result["gateways"]})
+
+    from booking_sync import sync_locks_for_hotel
+
+    lock_sync = sync_locks_for_hotel(hotel, gateways=result.get("gateways") or [])
+    hotel_spaces = list_spaces(owner_id=hotel.get("ownerId"), hotel_id=hotel_pk)
+    return jsonify(
+        {
+            "ok": True,
+            "mock": result["mock"],
+            "hotel": get_hotel(hotel_pk),
+            "gateways": result["gateways"],
+            "spaces": hotel_spaces,
+            "lockSync": lock_sync,
+        }
+    )
 
 
 @app.get("/api/bookings")
@@ -751,12 +781,86 @@ def put_parking_space(space_id: int):
 @app.delete("/api/parking-spaces/<int:space_id>")
 @require_manager
 def remove_parking_space(space_id: int):
+    """Free a parking lock: clear PIN on TTLock + DB, keep the space row as Available."""
     space = get_space(space_id)
     denied = ensure_space_access(space)
     if denied:
         return denied
-    delete_space(space_id)
-    return jsonify({"ok": True})
+
+    # Remove keyboard PIN from the physical TTLock.
+    if space.get("keyboardPwdId") or space.get("pin"):
+        _sync_space_keyboard_pin(space, "")
+
+    freed_booking_id = space.get("bookingId")
+    if freed_booking_id and space.get("ownerId"):
+        booking = get_booking_by_pms_id(space["ownerId"], freed_booking_id)
+        if booking and booking.get("status") in ("active", "unassigned"):
+            # Keep booking as unassigned so it can take the next free lock — but not this one
+            # until another lock is free (same request will not re-pin this space).
+            upsert_booking(
+                owner_id=space["ownerId"],
+                hotel_id=booking["hotelId"],
+                booking_id=booking["bookingId"],
+                guest_name=booking.get("guestName") or "",
+                arrival=booking.get("arrival"),
+                departure=booking.get("departure"),
+                status="unassigned",
+                pin=booking.get("pin") or pin_from_booking_safe(booking["bookingId"]),
+                parking_space_id=None,
+                keyboard_pwd_id=None,
+            )
+
+    update_space(
+        space_id,
+        pin=None,
+        bookingId=None,
+        keyboardPwdId=None,
+        enabled=True,
+    )
+    freed = get_space(space_id)
+
+    add_log(
+        action="space_free",
+        owner_id=space.get("ownerId"),
+        actor_user_id=current_user_id(),
+        parking_space_id=space["id"],
+        parking_space_name=space.get("name"),
+        lock_id=space.get("lockId"),
+        pin=space.get("pin"),
+        success=True,
+        message=f"Freed parking lock {space.get('name')} — now Available",
+    )
+
+    hotel_pk = space.get("hotelId")
+    # Retry other waiting bookings on remaining free locks (this lock stays free for the UI).
+    if hotel_pk and space.get("ownerId"):
+        from booking_sync import _assign_pin, _booking_payload_from_row
+        from models import list_unassigned_bookings_for_owner
+
+        hotel = get_hotel(hotel_pk, include_secrets=True)
+        if hotel and hotel.get("ttlockConfigured"):
+            for waiting in list_unassigned_bookings_for_owner(space["ownerId"], hotel_pk):
+                if freed_booking_id and str(waiting.get("bookingId")) == str(freed_booking_id):
+                    continue  # don't immediately put the same booking back on this lock
+                try:
+                    _assign_pin({"id": space["ownerId"]}, hotel, _booking_payload_from_row(waiting))
+                except Exception:
+                    pass
+
+    return jsonify(
+        {
+            "ok": True,
+            "space": freed,
+            "spaces": list_spaces(owner_id=space.get("ownerId"), hotel_id=hotel_pk) if hotel_pk else list_spaces(owner_id=space.get("ownerId")),
+            "message": f"{space.get('name')} is Available again.",
+        }
+    )
+
+
+def pin_from_booking_safe(booking_id: str) -> str:
+    digits = "".join(c for c in str(booking_id) if c.isdigit()) or "0"
+    return digits[-6:].rjust(6, "0")
+
 
 
 def _pin_command(action: str):

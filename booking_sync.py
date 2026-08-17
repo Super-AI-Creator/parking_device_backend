@@ -10,12 +10,16 @@ from beds24 import Beds24Error
 from models import (
     IntegrityError,
     add_log,
+    create_space,
     find_available_space,
     get_booking_by_pms_id,
     get_hotel,
     get_hotel_by_public_id,
     get_space,
+    get_space_by_owner_lock,
     list_active_bookings_for_owner,
+    list_hotels,
+    list_unassigned_bookings_for_owner,
     set_pms_credentials,
     update_space,
     upsert_booking,
@@ -111,6 +115,154 @@ def sync_hotels_for_user(user: dict) -> list[dict]:
     return hotels
 
 
+def _lock_name(lock: dict, lock_id: str) -> str:
+    return (
+        str(lock.get("lockAlias") or lock.get("lockName") or f"Park {lock_id}").strip()
+        or f"Park {lock_id}"
+    )
+
+
+def _collect_hotel_locks(client, gateways: list | None) -> tuple[list[tuple[dict, dict]], bool]:
+    """Locks from gateways plus the account lock list, de-duplicated by lockId."""
+    mock = False
+    if gateways is None:
+        try:
+            result = client.list_gateways(include_locks=True)
+        except TTLockError as exc:
+            logger.warning("Gateway lock list failed: %s", exc)
+            result = {"gateways": [], "mock": client.mock_mode}
+        gateways = result.get("gateways") or []
+        mock = bool(result.get("mock"))
+
+    extra_locks: list[dict] = []
+    try:
+        extra_locks = client.list_locks()
+        mock = mock or client.mock_mode
+    except TTLockError as exc:
+        logger.warning("Account lock list failed: %s", exc)
+
+    seen: set[str] = set()
+    pairs: list[tuple[dict, dict]] = []
+    for gateway in gateways:
+        for lock in gateway.get("locks") or []:
+            lock_id = str(lock.get("lockId") or lock.get("lock_id") or "").strip()
+            if not lock_id or lock_id in seen:
+                continue
+            seen.add(lock_id)
+            pairs.append((gateway, lock))
+    for lock in extra_locks:
+        lock_id = str(lock.get("lockId") or lock.get("lock_id") or "").strip()
+        if not lock_id or lock_id in seen:
+            continue
+        seen.add(lock_id)
+        pairs.append(({"gatewayId": "account"}, lock))
+    return pairs, mock
+
+
+def sync_locks_for_hotel(hotel: dict, gateways: list | None = None) -> dict:
+    """Import every TTLock lock on this hotel account as a parking space."""
+    hotel_full = get_hotel(hotel["id"], include_secrets=True)
+    if hotel_full is None or not hotel_full.get("ttlockConfigured"):
+        return {"ok": False, "error": "Hotel TTLock is not configured", "added": 0, "updated": 0, "spaces": []}
+
+    client = client_for_hotel(hotel_full)
+    try:
+        pairs, mock = _collect_hotel_locks(client, gateways)
+    except TTLockError as exc:
+        logger.warning("Lock sync failed for hotel %s: %s", hotel_full.get("hotelId"), exc)
+        return {"ok": False, "error": str(exc), "added": 0, "updated": 0, "spaces": []}
+
+    added = 0
+    updated = 0
+    errors: list[dict] = []
+    spaces = []
+    owner_id = hotel_full["ownerId"]
+
+    for gateway, lock in pairs:
+        lock_id = str(lock.get("lockId") or lock.get("lock_id") or "").strip()
+        if not lock_id:
+            continue
+        name = _lock_name(lock, lock_id)
+        existing = get_space_by_owner_lock(owner_id, lock_id)
+        if existing:
+            fields = {}
+            if existing.get("hotelId") != hotel_full["id"]:
+                fields["hotelId"] = hotel_full["id"]
+            if not existing.get("pin") and name and existing.get("name") != name:
+                fields["name"] = name
+            if existing.get("pin") == "":
+                fields["pin"] = None
+            if not existing.get("enabled"):
+                fields["enabled"] = True
+            if fields:
+                existing = update_space(existing["id"], **fields) or existing
+                updated += 1
+            spaces.append(existing)
+            continue
+        try:
+            space = create_space(
+                owner_id=owner_id,
+                hotel_id=hotel_full["id"],
+                name=name,
+                lock_id=lock_id,
+                pin=None,
+                enabled=True,
+                notes=f"Auto-imported from gateway {gateway.get('gatewayId') or ''}".strip(),
+            )
+            added += 1
+            spaces.append(space)
+        except IntegrityError as exc:
+            existing = get_space_by_owner_lock(owner_id, lock_id)
+            if existing:
+                spaces.append(existing)
+            else:
+                errors.append({"lockId": lock_id, "error": str(exc)})
+                logger.warning(
+                    "Failed to import lock %s for hotel %s: %s",
+                    lock_id,
+                    hotel_full.get("hotelId"),
+                    exc,
+                )
+
+    return {
+        "ok": len(errors) == 0,
+        "added": added,
+        "updated": updated,
+        "count": len(spaces),
+        "spaces": spaces,
+        "errors": errors,
+        "mock": mock,
+    }
+
+
+def sync_locks_for_user(user: dict) -> dict:
+    hotels = list_hotels(user["id"])
+    added = 0
+    updated = 0
+    for hotel in hotels:
+        if not hotel.get("ttlockConfigured"):
+            continue
+        result = sync_locks_for_hotel(hotel)
+        added += int(result.get("added") or 0)
+        updated += int(result.get("updated") or 0)
+    return {"ok": True, "added": added, "updated": updated, "hotels": len(hotels)}
+
+
+def _booking_payload_from_row(row: dict) -> dict:
+    """Rebuild a Beds24-like payload so unassigned DB rows can be retried."""
+    return {
+        "id": row.get("bookingId"),
+        "arrival": row.get("arrival"),
+        "departure": row.get("departure"),
+        "firstName": (row.get("guestName") or "").split(" ", 1)[0],
+        "lastName": (
+            (row.get("guestName") or "").split(" ", 1)[1]
+            if " " in (row.get("guestName") or "")
+            else ""
+        ),
+    }
+
+
 def _assign_pin(user: dict, hotel: dict, booking: dict) -> dict:
     booking_id = str(booking.get("id") or "")
     pin = pin_from_booking_id(booking_id)
@@ -120,6 +272,13 @@ def _assign_pin(user: dict, hotel: dict, booking: dict) -> dict:
         return existing
 
     space = find_available_space(hotel["id"])
+    if space is None and not hotel.get("_locksRefreshed"):
+        hotel["_locksRefreshed"] = True
+        try:
+            sync_locks_for_hotel(hotel)
+        except Exception as exc:
+            logger.warning("Lock refresh before PIN assign failed: %s", exc)
+        space = find_available_space(hotel["id"])
     if space is None:
         upsert_booking(
             owner_id=user["id"],
@@ -132,13 +291,18 @@ def _assign_pin(user: dict, hotel: dict, booking: dict) -> dict:
             pin=pin,
             raw_payload=booking,
         )
-        add_log(
-            action="booking_assign",
-            owner_id=user["id"],
-            success=False,
-            message=f"No available parking lock for hotel {hotel['hotelId']} booking {booking_id}",
-            pin=pin,
-        )
+        # Only log once when first becoming unassigned — avoid toast spam every minute.
+        if not existing or existing.get("status") != "unassigned":
+            add_log(
+                action="booking_assign",
+                owner_id=user["id"],
+                success=False,
+                message=(
+                    f"No free parking lock for hotel {hotel['hotelId']} booking {booking_id}. "
+                    f"All imported locks already have a PIN, or no TTLock locks were found for this hotel."
+                ),
+                pin=pin,
+            )
         return get_booking_by_pms_id(user["id"], booking_id)
 
     keyboard_id = None
@@ -292,6 +456,22 @@ def sync_bookings_for_user(user: dict) -> dict:
             _release_pin(user, row, "departed")
             released += 1
 
+    # Retry bookings that were waiting for a free lock (e.g. after Space delete/re-import).
+    for row in list_unassigned_bookings_for_owner(user["id"]):
+        if row["bookingId"] in departed_ids:
+            continue
+        hotel = get_hotel(row["hotelId"], include_secrets=True)
+        if hotel is None:
+            continue
+        try:
+            before = row.get("parkingSpaceId")
+            saved = _assign_pin(user, hotel, _booking_payload_from_row(row))
+            if saved and saved.get("parkingSpaceId") and saved.get("parkingSpaceId") != before:
+                assigned += 1
+        except Exception as exc:
+            errors += 1
+            logger.exception("Unassigned retry failed for %s: %s", row.get("bookingId"), exc)
+
     return {"ok": True, "assigned": assigned, "released": released, "errors": errors}
 
 
@@ -301,6 +481,7 @@ def sync_all_managers() -> None:
     for user in list_users_with_pms():
         try:
             sync_hotels_for_user(user)
+            sync_locks_for_user(user)
             result = sync_bookings_for_user(user)
             logger.info("PMS sync user=%s result=%s", user.get("username"), result)
         except Exception as exc:

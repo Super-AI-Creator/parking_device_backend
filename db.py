@@ -126,6 +126,13 @@ SCHEMA_STATEMENTS = [
       name             VARCHAR(120) NOT NULL,
       lock_id          VARCHAR(64)  NOT NULL,
       pin              VARCHAR(32)  NULL,
+      pin_slot         VARCHAR(96)
+                       GENERATED ALWAYS AS (
+                         CASE
+                           WHEN pin IS NULL OR pin = '' THEN NULL
+                           ELSE CONCAT(IFNULL(hotel_id, 0), ':', pin)
+                         END
+                       ) STORED,
       booking_id       VARCHAR(64)  NULL,
       keyboard_pwd_id  VARCHAR(64)  NULL,
       enabled          TINYINT(1)   NOT NULL DEFAULT 1,
@@ -133,8 +140,8 @@ SCHEMA_STATEMENTS = [
       created_at       DATETIME(0)  NOT NULL,
       updated_at       DATETIME(0)  NOT NULL,
       PRIMARY KEY (id),
-      UNIQUE KEY uq_parking_spaces_hotel_pin (hotel_id, pin),
       UNIQUE KEY uq_parking_spaces_owner_lock (owner_id, lock_id),
+      UNIQUE KEY uq_parking_spaces_pin_slot (pin_slot),
       KEY idx_parking_spaces_owner (owner_id),
       KEY idx_parking_spaces_hotel (hotel_id),
       KEY idx_parking_spaces_booking (booking_id),
@@ -262,10 +269,43 @@ def migrate_schema() -> None:
                     cur.execute("ALTER TABLE parking_spaces DROP INDEX uq_parking_spaces_pin")
                 except Exception:
                     pass
-            if not _index_exists(cur, "parking_spaces", "uq_parking_spaces_hotel_pin"):
+
+            # Old unique (hotel_id, pin) breaks free spaces: empty-string pins collide,
+            # so only one free lock could be imported per hotel.
+            if _index_exists(cur, "parking_spaces", "uq_parking_spaces_hotel_pin"):
+                try:
+                    cur.execute("ALTER TABLE parking_spaces DROP INDEX uq_parking_spaces_hotel_pin")
+                except Exception:
+                    pass
+
+            if not _column_exists(cur, "parking_spaces", "pin_slot"):
                 try:
                     cur.execute(
-                        "ALTER TABLE parking_spaces ADD UNIQUE KEY uq_parking_spaces_hotel_pin (hotel_id, pin)"
+                        """
+                        ALTER TABLE parking_spaces
+                        ADD COLUMN pin_slot VARCHAR(96)
+                        GENERATED ALWAYS AS (
+                          CASE
+                            WHEN pin IS NULL OR pin = '' THEN NULL
+                            ELSE CONCAT(IFNULL(hotel_id, 0), ':', pin)
+                          END
+                        ) STORED
+                        """
                     )
                 except Exception:
                     pass
+
+            if _column_exists(cur, "parking_spaces", "pin_slot") and not _index_exists(
+                cur, "parking_spaces", "uq_parking_spaces_pin_slot"
+            ):
+                try:
+                    cur.execute(
+                        "ALTER TABLE parking_spaces ADD UNIQUE KEY uq_parking_spaces_pin_slot (pin_slot)"
+                    )
+                except Exception:
+                    pass
+
+            try:
+                cur.execute("UPDATE parking_spaces SET pin = NULL WHERE pin = ''")
+            except Exception:
+                pass

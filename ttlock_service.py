@@ -213,6 +213,43 @@ class TTLockClient:
             )
         return locks
 
+    def list_locks(self, page_no: int = 1, page_size: int = 100) -> list[dict[str, Any]]:
+        """All locks on this TTLock account (not only those currently listed under a gateway)."""
+        if self.mock_mode:
+            return [
+                {
+                    "lockId": 10001,
+                    "lockName": "Mock Lock 1",
+                    "lockAlias": "Parking Space 1",
+                    "lockMac": "11:22:33:44:55:01",
+                },
+                {
+                    "lockId": 10002,
+                    "lockName": "Mock Lock 2",
+                    "lockAlias": "Parking Space 2",
+                    "lockMac": "11:22:33:44:55:02",
+                },
+            ]
+        data = self._api_post("/v3/lock/list", {"pageNo": page_no, "pageSize": page_size})
+        if data.get("errcode") not in (None, 0) and "list" not in data:
+            raise TTLockError(
+                data.get("errmsg") or data.get("description") or "Failed to list locks",
+                response=data,
+            )
+        locks = []
+        for item in data.get("list") or []:
+            locks.append(
+                {
+                    "lockId": item.get("lockId"),
+                    "lockMac": item.get("lockMac"),
+                    "lockName": item.get("lockName"),
+                    "lockAlias": item.get("lockAlias"),
+                    "rssi": item.get("rssi"),
+                    "updateDate": item.get("updateDate"),
+                }
+            )
+        return locks
+
     def _lock_command(self, lock_id: str | int, action: str) -> dict[str, Any]:
         path = f"/v3/lock/{action}"
         request_payload = {
