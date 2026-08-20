@@ -166,7 +166,7 @@ def sync_locks_for_hotel(hotel: dict, gateways: list | None = None) -> dict:
     """Import every TTLock lock on this hotel account as a parking space."""
     hotel_full = get_hotel(hotel["id"], include_secrets=True)
     if hotel_full is None or not hotel_full.get("ttlockConfigured"):
-        return {"ok": False, "error": "Hotel TTLock is not configured", "added": 0, "updated": 0, "spaces": []}
+        return {"ok": False, "error": "Hotel HHS Lock is not configured", "added": 0, "updated": 0, "spaces": []}
 
     client = client_for_hotel(hotel_full)
     try:
@@ -477,7 +477,7 @@ def _pick_space(hotel: dict, booking: dict) -> tuple[dict | None, str, str | Non
         spaces = list_spaces(hotel_id=hotel["id"])
         match = _match_space(spaces, parking_hints)
         if match is None:
-            return None, f"Auto mode: no TTLock matches booking parking '{parking_hints[0]}'", parking_hints[0]
+            return None, f"Auto mode: no HHS Lock matches booking parking '{parking_hints[0]}'", parking_hints[0]
         if not match.get("enabled"):
             return None, f"Auto mode: matched {match.get('name')} is disabled", parking_hints[0]
         if match.get("pin"):
@@ -493,6 +493,8 @@ def _assign_pin(user: dict, hotel: dict, booking: dict, unit_index: dict | None 
     guest = _guest_name(booking)
     existing = get_booking_by_pms_id(user["id"], booking_id)
     if existing and existing.get("status") == "active" and existing.get("parkingSpaceId"):
+        return existing
+    if hotel.get("blocked"):
         return existing
 
     if str(hotel.get("pinAssignMode") or "").lower() == "auto":
@@ -513,7 +515,7 @@ def _assign_pin(user: dict, hotel: dict, booking: dict, unit_index: dict | None 
         if pick_reason == "random":
             fail_message = (
                 f"No free parking lock for hotel {hotel['hotelId']} booking {booking_id}. "
-                f"All imported locks already have a PIN, or no TTLock locks were found for this hotel."
+                f"All imported locks already have a PIN, or no HHS Lock devices were found for this hotel."
             )
         else:
             fail_message = f"{pick_reason} (booking {booking_id}, hotel {hotel['hotelId']})"
@@ -685,6 +687,8 @@ def sync_bookings_for_user(user: dict) -> dict:
                     _release_pin(user, existing, "cancelled")
                     released += 1
                 continue
+            if hotel.get("blocked"):
+                continue
             _assign_pin(user, hotel, booking, unit_index)
             assigned += 1
         except Exception as exc:
@@ -703,6 +707,8 @@ def sync_bookings_for_user(user: dict) -> dict:
             continue
         hotel = get_hotel(row["hotelId"], include_secrets=True)
         if hotel is None:
+            continue
+        if hotel.get("blocked"):
             continue
         try:
             before = row.get("parkingSpaceId")

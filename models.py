@@ -299,7 +299,7 @@ def delete_user(user_id: int) -> bool:
 
 
 SPACE_SELECT = """
-SELECT s.*, h.hotel_id AS hotel_public_id, h.name AS hotel_name
+SELECT s.*, h.hotel_id AS hotel_public_id, h.name AS hotel_name, h.blocked AS hotel_blocked
 FROM parking_spaces s
 LEFT JOIN hotels h ON h.id = s.hotel_id
 """
@@ -314,6 +314,7 @@ def row_to_space(row: dict[str, Any] | None) -> dict[str, Any] | None:
         "hotelId": row.get("hotel_id"),
         "hotelPublicId": row.get("hotel_public_id") or "",
         "hotelName": row.get("hotel_name") or "",
+        "hotelBlocked": bool(row.get("hotel_blocked")),
         "name": row["name"],
         "lockId": row["lock_id"],
         "pin": row["pin"] or "",
@@ -720,6 +721,9 @@ def row_to_hotel(row: dict[str, Any] | None, *, include_secrets: bool = False) -
         "ttlockUsername": row["ttlock_username"] or "",
         "ttlockConfigured": bool(row["ttlock_username"] and row["ttlock_password_enc"]),
         "pinAssignMode": str(row.get("pin_assign_mode") or "random").lower(),
+        "blocked": bool(row.get("blocked")),
+        "ownerUsername": row.get("owner_username") or "",
+        "ownerCompany": row.get("owner_company") or "",
         "spaceCount": int(row.get("space_count") or 0),
         "availableSpaces": int(row.get("available_spaces") or 0),
         "createdAt": _iso(row["created_at"]),
@@ -732,9 +736,12 @@ def row_to_hotel(row: dict[str, Any] | None, *, include_secrets: bool = False) -
 
 HOTEL_SELECT = """
 SELECT h.*,
+  MAX(u.username) AS owner_username,
+  MAX(u.company_name) AS owner_company,
   COUNT(s.id) AS space_count,
   SUM(CASE WHEN s.enabled = 1 AND (s.pin IS NULL OR s.pin = '') THEN 1 ELSE 0 END) AS available_spaces
 FROM hotels h
+LEFT JOIN users u ON u.id = h.owner_id
 LEFT JOIN parking_spaces s ON s.hotel_id = h.id
 """
 
@@ -833,6 +840,19 @@ def set_hotel_pin_assign_mode(hotel_pk: int, mode: str) -> dict[str, Any] | None
             WHERE id = %s
             """,
             (mode, utc_now(), hotel_pk),
+        )
+    return get_hotel(hotel_pk)
+
+
+def set_hotel_blocked(hotel_pk: int, blocked: bool) -> dict[str, Any] | None:
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE hotels
+            SET blocked = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (1 if blocked else 0, utc_now(), hotel_pk),
         )
     return get_hotel(hotel_pk)
 

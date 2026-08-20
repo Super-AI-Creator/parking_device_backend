@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import logging
 import os
+import threading
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -46,6 +48,7 @@ from models import (
     list_logs,
     list_spaces,
     list_users,
+    set_hotel_blocked,
     set_hotel_pin_assign_mode,
     set_hotel_ttlock,
     set_pms_credentials,
@@ -57,7 +60,7 @@ from models import (
 )
 from rate_limit import AttemptLimiter
 from scheduler import start_scheduler
-from ttlock_service import TTLockClient, TTLockError, client_for_hotel, client_for_owner, client_for_space
+from ttlock_service import TTLockClient, TTLockError, clear_cached_token, client_for_hotel, client_for_owner, client_for_space
 
 app = Flask(__name__, static_folder=None)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -68,6 +71,8 @@ app.config.update(
     SESSION_COOKIE_SAMESITE=config.COOKIE_SAMESITE,
     SESSION_COOKIE_SECURE=config.COOKIE_SECURE,
 )
+
+logger = logging.getLogger(__name__)
 
 CORS(app, origins=config.CORS_ORIGINS, supports_credentials=True)
 
@@ -165,6 +170,35 @@ def _sync_space_keyboard_pin(space: dict, pin: str | None) -> str | None:
     except TTLockError:
         pass
     return old_id
+
+
+def _run_in_background(fn, *args, **kwargs) -> None:
+    threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True).start()
+
+
+def _finish_space_free(space: dict, freed_booking_id, hotel_pk, owner_id) -> None:
+    """Delete the lock PIN and retry other waiting bookings after Free returns."""
+    try:
+        if space.get("keyboardPwdId") or space.get("pin"):
+            _sync_space_keyboard_pin(space, "")
+        if not hotel_pk or not owner_id:
+            return
+        from booking_sync import _assign_pin, _booking_payload_from_row
+        from models import get_user, list_unassigned_bookings_for_owner
+
+        hotel = get_hotel(hotel_pk, include_secrets=True)
+        owner = get_user(owner_id, include_secrets=True)
+        if not hotel or hotel.get("blocked") or not hotel.get("ttlockConfigured") or not owner:
+            return
+        for waiting in list_unassigned_bookings_for_owner(owner_id, hotel_pk):
+            if freed_booking_id and str(waiting.get("bookingId")) == str(freed_booking_id):
+                continue
+            try:
+                _assign_pin(owner, hotel, _booking_payload_from_row(waiting))
+            except Exception:
+                logger.exception("PIN assign after free failed for booking %s", waiting.get("bookingId"))
+    except Exception:
+        logger.exception("Background free failed for space %s", space.get("id"))
 
 
 # ─── Public / auth ───────────────────────────────────────────────
@@ -347,19 +381,21 @@ def update_ttlock_credentials():
 
     if data.get("clear"):
         user = clear_ttlock_credentials(target_id)
-        return jsonify({"ok": True, "user": user, "message": "TTLock credentials cleared"})
+        clear_cached_token()
+        return jsonify({"ok": True, "user": user, "message": "HHS Lock credentials cleared"})
 
     if not username or not password:
-        return error("TTLock username and password are required")
+        return error("HHS Lock username and password are required")
 
     # Verify against TTLock before saving
     client = TTLockClient(username=username, password=password)
     try:
         verify = client.verify_credentials()
     except TTLockError as exc:
-        return error(f"TTLock login failed: {exc}", 400, ttlock=exc.response)
+        return error(f"HHS Lock login failed: {exc}", 400, ttlock=exc.response)
 
     user = set_ttlock_credentials(target_id, username, password)
+    clear_cached_token(username)
     return jsonify({"ok": True, "user": user, "verify": verify})
 
 
@@ -427,16 +463,16 @@ def update_pms_credentials():
         refresh_token = (existing.get("pmsRefreshToken") or "").strip()
 
     if not token:
-        return error("Beds24 access token or invite code is required")
+        return error("HHS PMS access token or invite code is required")
     if not refresh_token:
         return error(
-            "A Beds24 refresh token (or invite code) is required so ParkAccess can renew the access token automatically."
+            "An HHS PMS refresh token (or invite code) is required so ParkAccess can renew the access token automatically."
         )
 
     try:
         beds24.get_properties(token)
     except Beds24Error as exc:
-        return error(f"Beds24 token failed: {exc}", 400, beds24=exc.response)
+        return error(f"HHS PMS token failed: {exc}", 400, beds24=exc.response)
 
     user = set_pms_credentials(current_user_id(), token, refresh_token)
     secret_user = get_user(current_user_id(), include_secrets=True)
@@ -471,7 +507,7 @@ def sync_pms_hotels():
 
     user = get_user(current_user_id(), include_secrets=True)
     if not user or not user.get("pmsConfigured"):
-        return error("Save a Beds24 access token first", 400)
+        return error("Save an HHS PMS access token first", 400)
     try:
         hotels = sync_hotels_for_user(user)
     except Beds24Error as exc:
@@ -486,7 +522,7 @@ def sync_pms_bookings():
 
     user = get_user(current_user_id(), include_secrets=True)
     if not user or not user.get("pmsConfigured"):
-        return error("Save a Beds24 access token first", 400)
+        return error("Save an HHS PMS access token first", 400)
     try:
         sync_hotels_for_user(user)
         sync_locks_for_user(user)
@@ -516,20 +552,22 @@ def update_hotel_ttlock(hotel_pk: int):
     data = request.get_json(silent=True) or {}
     if data.get("clear"):
         updated = clear_hotel_ttlock(hotel_pk)
-        return jsonify({"ok": True, "hotel": updated, "message": "Hotel TTLock credentials cleared"})
+        clear_cached_token(hotel.get("ttlockUsername") or "")
+        return jsonify({"ok": True, "hotel": updated, "message": "Hotel HHS Lock credentials cleared"})
 
     username = str(data.get("username") or data.get("clientId") or "").strip()
     password = str(data.get("password") or "")
     if not username or not password:
-        return error("TTLock username and password are required")
+        return error("HHS Lock username and password are required")
 
     client = TTLockClient(username=username, password=password)
     try:
         verify = client.verify_credentials()
     except TTLockError as exc:
-        return error(f"TTLock login failed: {exc}", 400, ttlock=exc.response)
+        return error(f"HHS Lock login failed: {exc}", 400, ttlock=exc.response)
 
     updated = set_hotel_ttlock(hotel_pk, username, password)
+    clear_cached_token(username)
     from booking_sync import sync_locks_for_hotel
 
     lock_sync = sync_locks_for_hotel(updated)
@@ -540,7 +578,7 @@ def update_hotel_ttlock(hotel_pk: int):
             "verify": verify,
             "lockSync": lock_sync,
             "message": (
-                f"TTLock connected. Auto-imported {lock_sync.get('added', 0)} parking lock(s); "
+                f"HHS Lock connected. Auto-imported {lock_sync.get('added', 0)} parking lock(s); "
                 f"{lock_sync.get('count', 0)} total for this hotel."
             ),
         }
@@ -566,10 +604,43 @@ def update_hotel_settings(hotel_pk: int):
             "ok": True,
             "hotel": hotel,
             "message": (
-                "Auto mode: PIN goes on the TTLock whose name matches the booking parking info. "
+                "Auto mode: PIN goes on the HHS Lock whose name matches the booking parking info. "
                 "Random mode: PIN goes on any free lock."
                 if (hotel or {}).get("pinAssignMode") == "auto"
                 else "Random mode: PIN goes on any free parking lock."
+            ),
+        }
+    )
+
+
+@app.put("/api/admin/hotels/<int:hotel_pk>/block")
+@require_admin
+def admin_block_hotel(hotel_pk: int):
+    hotel = get_hotel(hotel_pk)
+    if hotel is None:
+        return error("Hotel not found", 404)
+
+    data = request.get_json(silent=True) or {}
+    blocked = bool(data.get("blocked"))
+    updated = set_hotel_blocked(hotel_pk, blocked)
+    add_log(
+        action="hotel_block" if blocked else "hotel_unblock",
+        owner_id=hotel.get("ownerId"),
+        actor_user_id=current_user_id(),
+        success=True,
+        message=(
+            f"{'Blocked' if blocked else 'Unblocked'} hotel {hotel.get('name')} "
+            f"(ID {hotel.get('hotelId')})"
+        ),
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "hotel": updated,
+            "message": (
+                f"{hotel.get('name')} is blocked. Customer PIN access and new PIN assignment are stopped."
+                if blocked
+                else f"{hotel.get('name')} is active again."
             ),
         }
     )
@@ -585,7 +656,7 @@ def get_hotel_gateways(hotel_pk: int):
 
     client = client_for_hotel(hotel)
     if not client.configured and not client.mock_mode:
-        return error("Save TTLock username and password for this hotel first.", 400)
+        return error("Save HHS Lock username and password for this hotel first.", 400)
 
     include_locks = request.args.get("includeLocks", "1") != "0"
     try:
@@ -667,7 +738,7 @@ def get_gateways():
     client = client_for_owner(target_id)
     if not client.configured and not client.mock_mode:
         return error(
-            "Add your TTLock username and password in Settings to load gateways for your region.",
+            "Add your HHS Lock username and password in Settings to load gateways for your region.",
             400,
         )
 
@@ -720,7 +791,7 @@ def post_parking_space():
     if not name:
         return error("Name is required")
     if not lock_id:
-        return error("TTLock lockId is required")
+        return error("HHS Lock lockId is required")
     if not hotel_pk:
         return error("Select a hotel before assigning a parking lock")
     hotel = get_hotel(int(hotel_pk))
@@ -810,22 +881,16 @@ def put_parking_space(space_id: int):
 @app.delete("/api/parking-spaces/<int:space_id>")
 @require_manager
 def remove_parking_space(space_id: int):
-    """Free a parking lock: clear PIN on TTLock + DB, keep the space row as Available."""
+    """Free a parking lock immediately in the UI; HHS Lock PIN delete continues in the background."""
     space = get_space(space_id)
     denied = ensure_space_access(space)
     if denied:
         return denied
 
-    # Remove keyboard PIN from the physical TTLock.
-    if space.get("keyboardPwdId") or space.get("pin"):
-        _sync_space_keyboard_pin(space, "")
-
     freed_booking_id = space.get("bookingId")
     if freed_booking_id and space.get("ownerId"):
         booking = get_booking_by_pms_id(space["ownerId"], freed_booking_id)
         if booking and booking.get("status") in ("active", "unassigned"):
-            # Keep booking as unassigned so it can take the next free lock — but not this one
-            # until another lock is free (same request will not re-pin this space).
             upsert_booking(
                 owner_id=space["ownerId"],
                 hotel_id=booking["hotelId"],
@@ -861,21 +926,13 @@ def remove_parking_space(space_id: int):
     )
 
     hotel_pk = space.get("hotelId")
-    # Retry other waiting bookings on remaining free locks (this lock stays free for the UI).
-    if hotel_pk and space.get("ownerId"):
-        from booking_sync import _assign_pin, _booking_payload_from_row
-        from models import get_user, list_unassigned_bookings_for_owner
-
-        hotel = get_hotel(hotel_pk, include_secrets=True)
-        owner = get_user(space["ownerId"], include_secrets=True)
-        if hotel and hotel.get("ttlockConfigured") and owner:
-            for waiting in list_unassigned_bookings_for_owner(space["ownerId"], hotel_pk):
-                if freed_booking_id and str(waiting.get("bookingId")) == str(freed_booking_id):
-                    continue  # don't immediately put the same booking back on this lock
-                try:
-                    _assign_pin(owner, hotel, _booking_payload_from_row(waiting))
-                except Exception:
-                    pass
+    _run_in_background(
+        _finish_space_free,
+        space,
+        freed_booking_id,
+        hotel_pk,
+        space.get("ownerId"),
+    )
 
     return jsonify(
         {
@@ -931,6 +988,20 @@ def _pin_command(action: str):
             message="Parking space is disabled",
         )
         return error("This parking space is currently unavailable", 403)
+
+    if space.get("hotelBlocked"):
+        unlock_limiter.register_failure(key)
+        add_log(
+            action=f"{action}_pin",
+            owner_id=space.get("ownerId"),
+            parking_space_id=space["id"],
+            parking_space_name=space["name"],
+            lock_id=space["lockId"],
+            pin=pin,
+            success=False,
+            message="Hotel is blocked",
+        )
+        return error("This hotel is blocked", 403)
 
     owner_id = space.get("ownerId")
     client = client_for_space(space)

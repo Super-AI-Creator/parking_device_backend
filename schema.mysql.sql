@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS hotels (
       ttlock_username      VARCHAR(190) NOT NULL DEFAULT '',
       ttlock_password_enc  TEXT         NOT NULL,
       pin_assign_mode      VARCHAR(16)  NOT NULL DEFAULT 'random',
+      blocked              TINYINT(1)   NOT NULL DEFAULT 0,
       created_at           DATETIME(0)  NOT NULL,
   updated_at           DATETIME(0)  NOT NULL,
   PRIMARY KEY (id),

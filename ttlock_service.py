@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import requests
@@ -12,6 +14,17 @@ import requests
 import config
 
 logger = logging.getLogger(__name__)
+
+_token_lock = threading.Lock()
+_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
+
+
+def clear_cached_token(username: str = "") -> None:
+    with _token_lock:
+        if username:
+            _TOKEN_CACHE.pop(username.strip().lower(), None)
+        else:
+            _TOKEN_CACHE.clear()
 
 
 class TTLockError(Exception):
@@ -65,8 +78,15 @@ class TTLockClient:
         if self._access_token and time.time() < self._token_expires_at - 60:
             return self._access_token
 
+        cache_key = self.username.lower()
+        with _token_lock:
+            cached = _TOKEN_CACHE.get(cache_key)
+            if cached and time.time() < cached[1] - 60:
+                self._access_token, self._token_expires_at = cached
+                return self._access_token
+
         if not self.configured:
-            raise TTLockError("TTLock credentials are not configured for this account")
+            raise TTLockError("HHS Lock credentials are not configured for this account")
 
         url = f"{config.TTLOCK_BASE_URL}/oauth2/token"
         payload = {
@@ -81,19 +101,21 @@ class TTLockClient:
             url,
             data=payload,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=30,
+            timeout=15,
         )
         data = response.json() if response.content else {}
 
         if response.status_code >= 400 or "access_token" not in data:
             raise TTLockError(
-                data.get("errmsg") or data.get("description") or "Failed to obtain TTLock access token",
+                data.get("errmsg") or data.get("description") or "Failed to obtain HHS Lock access token",
                 response=data,
             )
 
         self._access_token = data["access_token"]
         expires_in = int(data.get("expires_in", 7776000))
         self._token_expires_at = time.time() + expires_in
+        with _token_lock:
+            _TOKEN_CACHE[cache_key] = (self._access_token, self._token_expires_at)
         return self._access_token
 
     def _api_post(self, path: str, extra: dict[str, Any], timeout: int = 45) -> dict[str, Any]:
@@ -114,7 +136,7 @@ class TTLockClient:
         data = response.json() if response.content else {}
         if response.status_code >= 400:
             raise TTLockError(
-                data.get("errmsg") or data.get("description") or f"TTLock HTTP {response.status_code}",
+                data.get("errmsg") or data.get("description") or f"HHS Lock HTTP {response.status_code}",
                 response=data,
             )
         return data
@@ -123,7 +145,7 @@ class TTLockClient:
         if self.mock_mode and not self.configured:
             return {"ok": True, "mock": True, "message": "Mock mode — credentials not verified live"}
         token = self._get_access_token()
-        return {"ok": True, "mock": False, "message": "TTLock credentials verified", "tokenLength": len(token)}
+        return {"ok": True, "mock": False, "message": "HHS Lock credentials verified", "tokenLength": len(token)}
 
     @staticmethod
     def _gateway_version_label(version: Any) -> str:
@@ -186,13 +208,21 @@ class TTLockClient:
                 "isOnline": bool(item.get("isOnline")),
                 "locks": [],
             }
-            if include_locks and gateway_id is not None:
+            gateways.append(entry)
+
+        if include_locks:
+            def _load_locks(entry: dict[str, Any]) -> None:
+                gateway_id = entry.get("gatewayId")
+                if gateway_id is None:
+                    return
                 try:
                     entry["locks"] = self.list_gateway_locks(gateway_id)
                 except TTLockError as exc:
                     logger.warning("Failed to list locks for gateway %s: %s", gateway_id, exc)
                     entry["locksError"] = str(exc)
-            gateways.append(entry)
+
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(gateways)))) as pool:
+                list(pool.map(_load_locks, gateways))
 
         return {"success": True, "mock": False, "gateways": gateways, "raw": data}
 
@@ -400,7 +430,7 @@ class TTLockClient:
         }
         if self.mock_mode:
             return {"success": True, "mock": True, "keyboardPwdId": f"mock-{pin}", "response": extra}
-        data = self._api_post("/v3/keyboardPwd/add", extra, timeout=45)
+        data = self._api_post("/v3/keyboardPwd/add", extra, timeout=20)
         pwd_id = data.get("keyboardPwdId")
         success = bool(pwd_id) or data.get("errcode") in (0, None, -3007)
         return {
@@ -415,7 +445,7 @@ class TTLockClient:
         if self.mock_mode:
             return {"success": True, "mock": True}
         extra = {"lockId": lock_id, "keyboardPwdId": keyboard_pwd_id, "deleteType": 2}
-        data = self._api_post("/v3/keyboardPwd/delete", extra, timeout=45)
+        data = self._api_post("/v3/keyboardPwd/delete", extra, timeout=20)
         success = data.get("errcode") in (0, None)
         return {"success": success, "mock": False, "response": data, "message": data.get("errmsg") or ""}
 

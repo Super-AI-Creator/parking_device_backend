@@ -40,13 +40,13 @@ def _get(url: str, token: str, params: dict[str, Any] | None = None) -> Any:
     try:
         data = response.json()
     except Exception as exc:
-        raise Beds24Error(f"Beds24 returned invalid JSON ({response.status_code})") from exc
+        raise Beds24Error(f"HHS PMS returned invalid JSON ({response.status_code})") from exc
     if response.status_code >= 400 or "data" not in data:
         err = data.get("error") if isinstance(data, dict) else None
         if isinstance(err, dict):
             message = err.get("message") or str(err)
         else:
-            message = str(err or data.get("message") or f"Beds24 HTTP {response.status_code}")
+            message = str(err or data.get("message") or f"HHS PMS HTTP {response.status_code}")
         raise Beds24Error(
             message,
             response=data if isinstance(data, dict) else {},
@@ -77,7 +77,7 @@ def refresh_access_token(refresh_token: str) -> dict[str, str]:
     )
     data = response.json() if response.content else {}
     if response.status_code != 200 or "token" not in data:
-        raise Beds24Error("Failed to refresh Beds24 token", response=data, auth_failed=True)
+        raise Beds24Error("Failed to refresh HHS PMS token", response=data, auth_failed=True)
     return {
         "token": data["token"],
         "refreshToken": data.get("refreshToken") or refresh_token.strip(),
