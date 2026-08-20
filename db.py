@@ -108,6 +108,7 @@ SCHEMA_STATEMENTS = [
       check_out_end        VARCHAR(16)  NOT NULL DEFAULT '10:00',
       ttlock_username      VARCHAR(190) NOT NULL DEFAULT '',
       ttlock_password_enc  TEXT         NOT NULL,
+      pin_assign_mode      VARCHAR(16)  NOT NULL DEFAULT 'random',
       created_at           DATETIME(0)  NOT NULL,
       updated_at           DATETIME(0)  NOT NULL,
       PRIMARY KEY (id),
@@ -309,3 +310,8 @@ def migrate_schema() -> None:
                 cur.execute("UPDATE parking_spaces SET pin = NULL WHERE pin = ''")
             except Exception:
                 pass
+
+            if not _column_exists(cur, "hotels", "pin_assign_mode"):
+                cur.execute(
+                    "ALTER TABLE hotels ADD COLUMN pin_assign_mode VARCHAR(16) NOT NULL DEFAULT 'random'"
+                )

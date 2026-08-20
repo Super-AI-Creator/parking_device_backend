@@ -28,6 +28,21 @@ def _iso(value: Any) -> str | None:
     return str(value)
 
 
+def _parse_json(value: Any) -> Any:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:
+            return None
+    return value
+
+
 def _serializer() -> URLSafeSerializer:
     return URLSafeSerializer(config.SECRET_KEY, salt="parkaccess-ttlock")
 
@@ -704,6 +719,7 @@ def row_to_hotel(row: dict[str, Any] | None, *, include_secrets: bool = False) -
         "checkOutEnd": row["check_out_end"] or "10:00",
         "ttlockUsername": row["ttlock_username"] or "",
         "ttlockConfigured": bool(row["ttlock_username"] and row["ttlock_password_enc"]),
+        "pinAssignMode": str(row.get("pin_assign_mode") or "random").lower(),
         "spaceCount": int(row.get("space_count") or 0),
         "availableSpaces": int(row.get("available_spaces") or 0),
         "createdAt": _iso(row["created_at"]),
@@ -805,6 +821,22 @@ def set_hotel_ttlock(hotel_pk: int, username: str, password: str) -> dict[str, A
     return get_hotel(hotel_pk)
 
 
+def set_hotel_pin_assign_mode(hotel_pk: int, mode: str) -> dict[str, Any] | None:
+    mode = (mode or "random").strip().lower()
+    if mode not in {"random", "auto"}:
+        raise ValueError("PIN assignment mode must be random or auto")
+    with get_cursor() as cur:
+        cur.execute(
+            """
+            UPDATE hotels
+            SET pin_assign_mode = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (mode, utc_now(), hotel_pk),
+        )
+    return get_hotel(hotel_pk)
+
+
 def clear_hotel_ttlock(hotel_pk: int) -> dict[str, Any] | None:
     with get_cursor() as cur:
         cur.execute(
@@ -876,6 +908,7 @@ def row_to_booking(row: dict[str, Any] | None) -> dict[str, Any] | None:
         "parkingSpaceId": row["parking_space_id"],
         "parkingSpaceName": row.get("space_name") or "",
         "keyboardPwdId": row["keyboard_pwd_id"],
+        "rawPayload": _parse_json(row.get("raw_payload")),
         "createdAt": _iso(row["created_at"]),
         "updatedAt": _iso(row["updated_at"]),
     }
@@ -923,8 +956,11 @@ def upsert_booking(
     raw_payload: Any = None,
 ) -> dict[str, Any]:
     now = utc_now()
-    payload = json.dumps(raw_payload) if raw_payload is not None else None
     existing = get_booking_by_pms_id(owner_id, booking_id)
+    if raw_payload is None and existing and existing.get("rawPayload") is not None:
+        payload = json.dumps(existing["rawPayload"])
+    else:
+        payload = json.dumps(raw_payload) if raw_payload is not None else None
     if existing:
         with get_cursor() as cur:
             cur.execute(

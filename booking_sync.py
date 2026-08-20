@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 
 import beds24
@@ -19,6 +21,7 @@ from models import (
     get_space_by_owner_lock,
     list_active_bookings_for_owner,
     list_hotels,
+    list_spaces,
     list_unassigned_bookings_for_owner,
     set_pms_credentials,
     update_space,
@@ -250,20 +253,241 @@ def sync_locks_for_user(user: dict) -> dict:
 
 def _booking_payload_from_row(row: dict) -> dict:
     """Rebuild a Beds24-like payload so unassigned DB rows can be retried."""
-    return {
-        "id": row.get("bookingId"),
-        "arrival": row.get("arrival"),
-        "departure": row.get("departure"),
-        "firstName": (row.get("guestName") or "").split(" ", 1)[0],
-        "lastName": (
-            (row.get("guestName") or "").split(" ", 1)[1]
-            if " " in (row.get("guestName") or "")
-            else ""
-        ),
-    }
+    raw = row.get("rawPayload") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    payload = dict(raw)
+    payload.setdefault("id", row.get("bookingId"))
+    payload.setdefault("arrival", row.get("arrival"))
+    payload.setdefault("departure", row.get("departure"))
+    if not payload.get("firstName") and not payload.get("lastName"):
+        guest = row.get("guestName") or ""
+        payload["firstName"] = guest.split(" ", 1)[0]
+        payload["lastName"] = guest.split(" ", 1)[1] if " " in guest else ""
+    return payload
 
 
-def _assign_pin(user: dict, hotel: dict, booking: dict) -> dict:
+def _normalize_park_label(value) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return " ".join(text.split())
+
+
+def _collect_text_values(node, into: list[str], *, depth: int = 0) -> None:
+    if depth > 4 or node is None:
+        return
+    if isinstance(node, str):
+        text = node.strip()
+        if text:
+            into.append(text)
+        return
+    if isinstance(node, (int, float)) and not isinstance(node, bool):
+        into.append(str(node))
+        return
+    if isinstance(node, dict):
+        for key, value in node.items():
+            key_l = str(key).lower()
+            if any(token in key_l for token in ("park", "unit", "room", "space", "spot", "stall")):
+                _collect_text_values(value, into, depth=depth + 1)
+            elif key_l in {"name", "title", "label", "description", "text", "value", "code", "comment", "comments", "note", "notes"}:
+                _collect_text_values(value, into, depth=depth + 1)
+            elif isinstance(value, (dict, list)):
+                _collect_text_values(value, into, depth=depth + 1)
+        return
+    if isinstance(node, list):
+        for item in node[:30]:
+            _collect_text_values(item, into, depth=depth + 1)
+
+
+def parking_hints_from_booking(booking: dict) -> list[str]:
+    """Pull parking / unit / room labels from a Beds24 booking payload."""
+    hints: list[str] = []
+    for key in (
+        "unitName",
+        "unit_name",
+        "roomName",
+        "room_name",
+        "parking",
+        "parkingName",
+        "parkingSpace",
+        "parking_space",
+        "offerName",
+        "unit",
+        "room",
+    ):
+        value = booking.get(key)
+        if isinstance(value, str) and value.strip():
+            hints.append(value.strip())
+        elif isinstance(value, dict):
+            for inner in ("name", "unitName", "roomName", "title", "label"):
+                if value.get(inner):
+                    hints.append(str(value[inner]).strip())
+    _collect_text_values(booking.get("invoiceItems"), hints)
+    _collect_text_values(booking.get("infoItems"), hints)
+    for key in ("comments", "comment", "note", "notes", "guestComments"):
+        if booking.get(key):
+            hints.append(str(booking[key]).strip())
+
+    room_name = str(booking.get("roomName") or booking.get("room_name") or "").strip()
+    unit_label = str(booking.get("unitName") or booking.get("unit_name") or "").strip()
+    if not unit_label:
+        unit_label = str(booking.get("unitId") or "").strip()
+    room_norm = _normalize_park_label(room_name)
+    unit_norm = _normalize_park_label(unit_label)
+    if "park" in room_norm and unit_label:
+        if "park" in unit_norm:
+            hints.append(unit_label)
+        else:
+            hints.append(f"Park {unit_label}")
+
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for hint in hints:
+        if "[" in hint and "]" in hint:
+            continue
+        norm = _normalize_park_label(hint)
+        if not norm or norm in seen:
+            continue
+        if "park" not in norm and (len(norm) < 3 or norm.isdigit()):
+            continue
+        seen.add(norm)
+        cleaned.append(hint.strip())
+    return cleaned
+
+
+def _space_match_score(space: dict, hints: list[str]) -> int:
+    name = _normalize_park_label(space.get("name") or "")
+    lock_id = _normalize_park_label(space.get("lockId") or "")
+    if not name:
+        return 0
+    best = 0
+    for hint in hints:
+        hn = _normalize_park_label(hint)
+        if not hn:
+            continue
+        if hn == name or hn == lock_id:
+            best = max(best, 100)
+            continue
+        if any(c.isalpha() for c in hn) and (hn in name or name in hn):
+            best = max(best, 80)
+            continue
+        hint_num = re.search(r"(\d+)$", hn)
+        name_num = re.search(r"(\d+)$", name)
+        if hint_num and name_num and hint_num.group(1) == name_num.group(1):
+            if "park" in hn and "park" in name:
+                best = max(best, 70)
+    return best
+
+
+def _match_space(spaces: list[dict], hints: list[str]) -> dict | None:
+    ranked = []
+    for space in spaces:
+        score = _space_match_score(space, hints)
+        if score >= 70:
+            ranked.append((score, space))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (-item[0], item[1].get("id") or 0))
+    return ranked[0][1]
+
+
+def _unit_name_index(properties: list[dict]) -> dict[tuple[str, str, str], str]:
+    index: dict[tuple[str, str, str], str] = {}
+    for prop in properties or []:
+        pid = str(prop.get("id") or "")
+        rooms = prop.get("roomTypes") or prop.get("rooms") or []
+        if isinstance(prop.get("unitDetails"), list):
+            rooms = list(rooms) + list(prop.get("unitDetails") or [])
+        for room in rooms:
+            if not isinstance(room, dict):
+                continue
+            room_id = str(room.get("id") or room.get("roomId") or "")
+            room_name = str(room.get("name") or room.get("roomName") or "").strip()
+            if pid and room_id and room_name:
+                index[(pid, "room", room_id)] = room_name
+            for unit in room.get("units") or room.get("unitDetails") or []:
+                if not isinstance(unit, dict):
+                    continue
+                unit_id = str(unit.get("id") or unit.get("unitId") or "")
+                unit_name = str(unit.get("name") or unit.get("unitName") or room_name).strip()
+                if pid and unit_id and unit_name:
+                    index[(pid, "unit", unit_id)] = unit_name
+    return index
+
+
+def _enrich_booking(booking: dict, unit_index: dict[tuple[str, str, str], str]) -> dict:
+    if not isinstance(booking, dict):
+        return {}
+    enriched = dict(booking)
+    pid = str(enriched.get("propertyId") or "")
+    unit_id = str(enriched.get("unitId") or "")
+    room_id = str(enriched.get("roomId") or "")
+    if pid and unit_id and (pid, "unit", unit_id) in unit_index:
+        enriched.setdefault("unitName", unit_index[(pid, "unit", unit_id)])
+    if pid and room_id and (pid, "room", room_id) in unit_index:
+        enriched.setdefault("roomName", unit_index[(pid, "room", room_id)])
+    return enriched
+
+
+def _booking_needs_detail(booking: dict) -> bool:
+    if booking.get("propertyId") and (booking.get("unitId") or booking.get("roomId")):
+        return False
+    if parking_hints_from_booking(booking):
+        return False
+    return True
+
+
+def _refresh_booking_detail(user: dict, booking: dict) -> dict:
+    """Beds24 list filters often omit room/unit fields; fetch the booking by id when Auto needs them."""
+    if not _booking_needs_detail(booking):
+        return booking
+    booking_id = str(booking.get("id") or "")
+    if not booking_id:
+        return booking
+    try:
+        fresh = _beds24_call(user, beds24.get_booking, booking_id)
+    except Beds24Error as exc:
+        logger.warning("Beds24 booking %s detail fetch failed: %s", booking_id, exc)
+        return booking
+    if not isinstance(fresh, dict):
+        return booking
+    merged = dict(fresh)
+    for key, value in booking.items():
+        if key not in merged or merged.get(key) in (None, "", [], {}):
+            merged[key] = value
+    return merged
+
+
+def _pick_space(hotel: dict, booking: dict) -> tuple[dict | None, str, str | None]:
+    """
+    Returns (space, reason, unmatched_hint).
+    reason is 'random', 'auto', or a failure explanation used in logs.
+    """
+    mode = str(hotel.get("pinAssignMode") or "random").lower()
+    if mode not in {"random", "auto"}:
+        mode = "random"
+    hints = parking_hints_from_booking(booking)
+    parking_hints = [hint for hint in hints if "park" in _normalize_park_label(hint)]
+    if mode == "auto" and parking_hints:
+        spaces = list_spaces(hotel_id=hotel["id"])
+        match = _match_space(spaces, parking_hints)
+        if match is None:
+            return None, f"Auto mode: no TTLock matches booking parking '{parking_hints[0]}'", parking_hints[0]
+        if not match.get("enabled"):
+            return None, f"Auto mode: matched {match.get('name')} is disabled", parking_hints[0]
+        if match.get("pin"):
+            return None, f"Auto mode: matched {match.get('name')} is already occupied", parking_hints[0]
+        return match, f"auto:{match.get('name')}", parking_hints[0]
+    space = find_available_space(hotel["id"])
+    return space, "random", parking_hints[0] if parking_hints else (hints[0] if hints else None)
+
+
+def _assign_pin(user: dict, hotel: dict, booking: dict, unit_index: dict | None = None) -> dict:
     booking_id = str(booking.get("id") or "")
     pin = pin_from_booking_id(booking_id)
     guest = _guest_name(booking)
@@ -271,15 +495,28 @@ def _assign_pin(user: dict, hotel: dict, booking: dict) -> dict:
     if existing and existing.get("status") == "active" and existing.get("parkingSpaceId"):
         return existing
 
-    space = find_available_space(hotel["id"])
+    if str(hotel.get("pinAssignMode") or "").lower() == "auto":
+        booking = _refresh_booking_detail(user, booking)
+    if unit_index:
+        booking = _enrich_booking(booking, unit_index)
+    guest = _guest_name(booking)
+
+    space, pick_reason, hint = _pick_space(hotel, booking)
     if space is None and not hotel.get("_locksRefreshed"):
         hotel["_locksRefreshed"] = True
         try:
             sync_locks_for_hotel(hotel)
         except Exception as exc:
             logger.warning("Lock refresh before PIN assign failed: %s", exc)
-        space = find_available_space(hotel["id"])
+        space, pick_reason, hint = _pick_space(hotel, booking)
     if space is None:
+        if pick_reason == "random":
+            fail_message = (
+                f"No free parking lock for hotel {hotel['hotelId']} booking {booking_id}. "
+                f"All imported locks already have a PIN, or no TTLock locks were found for this hotel."
+            )
+        else:
+            fail_message = f"{pick_reason} (booking {booking_id}, hotel {hotel['hotelId']})"
         upsert_booking(
             owner_id=user["id"],
             hotel_id=hotel["id"],
@@ -297,10 +534,7 @@ def _assign_pin(user: dict, hotel: dict, booking: dict) -> dict:
                 action="booking_assign",
                 owner_id=user["id"],
                 success=False,
-                message=(
-                    f"No free parking lock for hotel {hotel['hotelId']} booking {booking_id}. "
-                    f"All imported locks already have a PIN, or no TTLock locks were found for this hotel."
-                ),
+                message=fail_message,
                 pin=pin,
             )
         return get_booking_by_pms_id(user["id"], booking_id)
@@ -369,7 +603,7 @@ def _assign_pin(user: dict, hotel: dict, booking: dict) -> dict:
         lock_id=space["lockId"],
         pin=pin,
         success=True,
-        message=f"Assigned PIN {pin} for booking {booking_id} at hotel {hotel['hotelId']}",
+        message=f"Assigned PIN {pin} for booking {booking_id} at hotel {hotel['hotelId']} ({pick_reason})",
     )
     return saved
 
@@ -428,8 +662,15 @@ def sync_bookings_for_user(user: dict) -> dict:
         logger.warning("Beds24 fetch failed for %s: %s", user.get("username"), exc)
         return {"ok": False, "error": str(exc)}
 
+    unit_index: dict[tuple[str, str, str], str] = {}
+    try:
+        unit_index = _unit_name_index(_beds24_call(user, beds24.get_properties))
+    except Beds24Error as exc:
+        logger.warning("Beds24 property lookup failed for %s: %s", user.get("username"), exc)
+
     seen_ids = set()
     for booking in list(new_bookings) + list(modified):
+        booking = _enrich_booking(booking, unit_index)
         booking_id = str(booking.get("id") or "")
         if not booking_id or booking_id in seen_ids:
             continue
@@ -444,7 +685,7 @@ def sync_bookings_for_user(user: dict) -> dict:
                     _release_pin(user, existing, "cancelled")
                     released += 1
                 continue
-            _assign_pin(user, hotel, booking)
+            _assign_pin(user, hotel, booking, unit_index)
             assigned += 1
         except Exception as exc:
             errors += 1
@@ -465,7 +706,8 @@ def sync_bookings_for_user(user: dict) -> dict:
             continue
         try:
             before = row.get("parkingSpaceId")
-            saved = _assign_pin(user, hotel, _booking_payload_from_row(row))
+            payload = _enrich_booking(_booking_payload_from_row(row), unit_index)
+            saved = _assign_pin(user, hotel, payload, unit_index)
             if saved and saved.get("parkingSpaceId") and saved.get("parkingSpaceId") != before:
                 assigned += 1
         except Exception as exc:

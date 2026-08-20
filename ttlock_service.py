@@ -26,11 +26,15 @@ class TTLockClient:
     username/password are the TTLock account that owns gateways/locks (per manager).
     """
 
+    # TTLock parking locks (BM series): lockVersion.scene 2 or 7.
+    PARKING_SCENES = {2, 7}
+
     def __init__(self, username: str = "", password: str = "") -> None:
         self.username = (username or "").strip()
         self.password = password or ""
         self._access_token: str | None = None
         self._token_expires_at: float = 0
+        self._lock_detail_cache: dict[str, dict[str, Any]] = {}
 
     @classmethod
     def for_manager(cls, user: dict[str, Any]) -> "TTLockClient":
@@ -250,14 +254,56 @@ class TTLockClient:
             )
         return locks
 
-    def _lock_command(self, lock_id: str | int, action: str) -> dict[str, Any]:
+    def get_lock_detail(self, lock_id: str | int) -> dict[str, Any]:
+        key = str(lock_id)
+        cached = self._lock_detail_cache.get(key)
+        if cached:
+            return cached
+        if self.mock_mode:
+            detail = {
+                "lockId": lock_id,
+                "lockVersion": {"scene": 2},
+                "modelNum": "MOCK-PARK",
+                "errcode": 0,
+            }
+        else:
+            detail = self._api_post("/v3/lock/detail", {"lockId": lock_id})
+        self._lock_detail_cache[key] = detail
+        return detail
+
+    def query_open_state(self, lock_id: str | int) -> dict[str, Any]:
+        if self.mock_mode:
+            return {"state": 0, "electricQuantity": 100, "mock": True}
+        return self._api_post("/v3/lock/queryOpenState", {"lockId": lock_id})
+
+    def is_parking_lock(self, lock_id: str | int) -> bool:
+        try:
+            detail = self.get_lock_detail(lock_id)
+        except TTLockError:
+            return True
+        scene = (detail.get("lockVersion") or {}).get("scene")
+        try:
+            scene = int(scene)
+        except (TypeError, ValueError):
+            scene = None
+        model = str(detail.get("modelNum") or detail.get("lockName") or "").upper()
+        return scene in self.PARKING_SCENES or model.startswith("BM") or "SN9194" in model
+
+    def _lock_command(
+        self,
+        lock_id: str | int,
+        action: str,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         path = f"/v3/lock/{action}"
+        payload = {"lockId": lock_id, "type": 2, **(extra or {})}
         request_payload = {
             "clientId": config.TTLOCK_CLIENT_ID or "(mock)",
             "lockId": str(lock_id),
             "date": int(time.time() * 1000),
             "endpoint": f"{config.TTLOCK_BASE_URL}{path}",
             "action": action,
+            "params": {key: payload[key] for key in payload if key != "lockId"},
         }
 
         if self.mock_mode:
@@ -276,7 +322,7 @@ class TTLockClient:
             }
 
         request_payload["accessToken"] = "***redacted***"
-        data = self._api_post(path, {"lockId": lock_id}, timeout=45)
+        data = self._api_post(path, payload, timeout=45)
         errcode = data.get("errcode", 0)
         success = errcode == 0
         message = data.get("errmsg") or data.get("description") or (
@@ -292,11 +338,47 @@ class TTLockClient:
             "response": data,
         }
 
+    def _open_state_value(self, lock_id: str | int) -> int | None:
+        try:
+            state = self.query_open_state(lock_id)
+        except TTLockError as exc:
+            logger.warning("Could not read open state for lockId=%s: %s", lock_id, exc)
+            return None
+        try:
+            return int(state.get("state"))
+        except (TypeError, ValueError):
+            return None
+
     def unlock(self, lock_id: str | int) -> dict[str, Any]:
         return self._lock_command(lock_id, "unlock")
 
     def lock(self, lock_id: str | int) -> dict[str, Any]:
-        return self._lock_command(lock_id, "lock")
+        """Raise a parking barrier. Same gateway packet as Open, then wait for the motor."""
+        parking = self.is_parking_lock(lock_id)
+        if not parking:
+            return self._lock_command(lock_id, "lock")
+
+        # Do not send extra controlType/controlAction, and do not fire a second
+        # close ~1s later — that interrupts the BM1002 motor after the beep.
+        result = self._lock_command(lock_id, "lock")
+        if not result.get("success"):
+            return result
+
+        time.sleep(6.5)
+        after = self._open_state_value(lock_id)
+        result.setdefault("response", {})
+        if isinstance(result["response"], dict) and after is not None:
+            result["response"]["openState"] = {"state": after}
+
+        if after == 0:
+            result["message"] = "Barrier locked"
+        elif after == 1:
+            result["success"] = False
+            result["message"] = (
+                "The parking lock beeped but the barrier stayed down. "
+                "Stand clear of the sensor and make sure no car is on the space, then try Lock again."
+            )
+        return result
 
     def add_keyboard_pin(
         self,

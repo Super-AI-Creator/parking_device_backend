@@ -94,7 +94,11 @@ def get_properties(token: str) -> list[dict[str, Any]]:
 
 
 def get_new_bookings(token: str) -> list[dict[str, Any]]:
-    data = _get(f"{BEDS24_API_URL}/bookings", token, {"filter": "new"})
+    data = _get(
+        f"{BEDS24_API_URL}/bookings",
+        token,
+        {"filter": "new", "includeInfoItems": "true", "includeInvoiceItems": "true"},
+    )
     return data if isinstance(data, list) else []
 
 
@@ -104,7 +108,12 @@ def get_modified_bookings(token: str) -> list[dict[str, Any]]:
     data = _get(
         f"{BEDS24_API_URL}/bookings",
         token,
-        {"modifiedFrom": yesterday, "modifiedTo": tomorrow},
+        {
+            "modifiedFrom": yesterday,
+            "modifiedTo": tomorrow,
+            "includeInfoItems": "true",
+            "includeInvoiceItems": "true",
+        },
     )
     return data if isinstance(data, list) else []
 
@@ -113,3 +122,21 @@ def get_departed_bookings(token: str) -> list[dict[str, Any]]:
     yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     data = _get(f"{BEDS24_API_URL}/bookings", token, {"departureTo": yesterday})
     return data if isinstance(data, list) else []
+
+
+def get_booking(token: str, booking_id: str) -> dict[str, Any] | None:
+    data = _get(
+        f"{BEDS24_API_URL}/bookings",
+        token,
+        {
+            "id": str(booking_id),
+            "includeInfoItems": "true",
+            "includeInvoiceItems": "true",
+        },
+    )
+    if isinstance(data, list) and data:
+        first = data[0]
+        return first if isinstance(first, dict) else None
+    if isinstance(data, dict) and data.get("id"):
+        return data
+    return None

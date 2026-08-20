@@ -46,6 +46,7 @@ from models import (
     list_logs,
     list_spaces,
     list_users,
+    set_hotel_pin_assign_mode,
     set_hotel_ttlock,
     set_pms_credentials,
     set_ttlock_credentials,
@@ -546,6 +547,34 @@ def update_hotel_ttlock(hotel_pk: int):
     )
 
 
+@app.put("/api/hotels/<int:hotel_pk>")
+@require_manager
+def update_hotel_settings(hotel_pk: int):
+    hotel = get_hotel(hotel_pk)
+    denied = ensure_hotel_access(hotel)
+    if denied:
+        return denied
+
+    data = request.get_json(silent=True) or {}
+    if "pinAssignMode" in data:
+        try:
+            hotel = set_hotel_pin_assign_mode(hotel_pk, str(data.get("pinAssignMode") or ""))
+        except ValueError as exc:
+            return error(str(exc))
+    return jsonify(
+        {
+            "ok": True,
+            "hotel": hotel,
+            "message": (
+                "Auto mode: PIN goes on the TTLock whose name matches the booking parking info. "
+                "Random mode: PIN goes on any free lock."
+                if (hotel or {}).get("pinAssignMode") == "auto"
+                else "Random mode: PIN goes on any free parking lock."
+            ),
+        }
+    )
+
+
 @app.get("/api/hotels/<int:hotel_pk>/gateways")
 @require_manager
 def get_hotel_gateways(hotel_pk: int):
@@ -835,15 +864,16 @@ def remove_parking_space(space_id: int):
     # Retry other waiting bookings on remaining free locks (this lock stays free for the UI).
     if hotel_pk and space.get("ownerId"):
         from booking_sync import _assign_pin, _booking_payload_from_row
-        from models import list_unassigned_bookings_for_owner
+        from models import get_user, list_unassigned_bookings_for_owner
 
         hotel = get_hotel(hotel_pk, include_secrets=True)
-        if hotel and hotel.get("ttlockConfigured"):
+        owner = get_user(space["ownerId"], include_secrets=True)
+        if hotel and hotel.get("ttlockConfigured") and owner:
             for waiting in list_unassigned_bookings_for_owner(space["ownerId"], hotel_pk):
                 if freed_booking_id and str(waiting.get("bookingId")) == str(freed_booking_id):
                     continue  # don't immediately put the same booking back on this lock
                 try:
-                    _assign_pin({"id": space["ownerId"]}, hotel, _booking_payload_from_row(waiting))
+                    _assign_pin(owner, hotel, _booking_payload_from_row(waiting))
                 except Exception:
                     pass
 
