@@ -606,8 +606,8 @@ def update_hotel_settings(hotel_pk: int):
             "ok": True,
             "hotel": hotel,
             "message": (
-                "Auto mode: PIN goes on the HHS Lock whose name matches parking text in the booking. "
-                "If the booking has no parking text, no PIN is created."
+                "Auto mode: PIN goes on the HHS Lock that matches the booking parking room "
+                "(Park/Parking unit 1 → Park 1). Guest rooms do not get a PIN."
                 if (hotel or {}).get("pinAssignMode") == "auto"
                 else "Random mode: PIN goes on any free parking lock."
             ),

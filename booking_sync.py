@@ -329,8 +329,14 @@ def _collect_text_values(node, into: list[str], *, depth: int = 0) -> None:
             _collect_text_values(item, into, depth=depth + 1)
 
 
+def _is_parking_room_label(value) -> bool:
+    """True for catalog names like Park, Parking, Parkplatz."""
+    norm = _normalize_park_label(value)
+    return "park" in norm
+
+
 def parking_hints_from_booking(booking: dict) -> list[str]:
-    """Pull parking / unit / room labels from a Beds24 booking payload."""
+    """Pull parking / unit / room labels from a booking plus hotel catalog names."""
     hints: list[str] = []
     for key in (
         "unitName",
@@ -357,6 +363,17 @@ def parking_hints_from_booking(booking: dict) -> list[str]:
     for key in ("comments", "comment", "note", "notes", "guestComments"):
         if booking.get(key):
             hints.append(str(booking[key]).strip())
+
+    room_name = str(booking.get("roomName") or booking.get("room_name") or "").strip()
+    unit_label = str(booking.get("unitName") or booking.get("unit_name") or "").strip()
+    if not unit_label:
+        unit_label = str(booking.get("unitId") or "").strip()
+    if _is_parking_room_label(room_name) and unit_label:
+        if _is_parking_room_label(unit_label) and re.search(r"\d+", unit_label):
+            hints.append(unit_label)
+        else:
+            num = re.search(r"(\d+)$", _normalize_park_label(unit_label))
+            hints.append(f"Park {num.group(1)}" if num else f"Park {unit_label}")
 
     seen: set[str] = set()
     cleaned: list[str] = []
@@ -412,8 +429,9 @@ def _match_space(spaces: list[dict], hints: list[str]) -> dict | None:
     return ranked[0][1]
 
 
-def _unit_name_index(properties: list[dict]) -> dict[tuple[str, str, str], str]:
-    index: dict[tuple[str, str, str], str] = {}
+def _unit_name_index(properties: list[dict]) -> dict[tuple, str]:
+    """Map (property, room) and (property, room, unit) to catalog names."""
+    index: dict[tuple, str] = {}
     for prop in properties or []:
         pid = str(prop.get("id") or "")
         rooms = prop.get("roomTypes") or prop.get("rooms") or []
@@ -430,23 +448,28 @@ def _unit_name_index(properties: list[dict]) -> dict[tuple[str, str, str], str]:
                 if not isinstance(unit, dict):
                     continue
                 unit_id = str(unit.get("id") or unit.get("unitId") or "")
-                unit_name = str(unit.get("name") or unit.get("unitName") or room_name).strip()
-                if pid and unit_id and unit_name:
-                    index[(pid, "unit", unit_id)] = unit_name
+                unit_name = str(unit.get("name") or unit.get("unitName") or "").strip()
+                if pid and room_id and unit_id:
+                    index[(pid, "room_unit", room_id, unit_id)] = unit_name or unit_id
     return index
 
 
-def _enrich_booking(booking: dict, unit_index: dict[tuple[str, str, str], str]) -> dict:
+def _enrich_booking(booking: dict, unit_index: dict | None) -> dict:
     if not isinstance(booking, dict):
         return {}
     enriched = dict(booking)
+    if not unit_index:
+        return enriched
     pid = str(enriched.get("propertyId") or "")
     unit_id = str(enriched.get("unitId") or "")
     room_id = str(enriched.get("roomId") or "")
-    if pid and unit_id and (pid, "unit", unit_id) in unit_index:
-        enriched.setdefault("unitName", unit_index[(pid, "unit", unit_id)])
     if pid and room_id and (pid, "room", room_id) in unit_index:
-        enriched.setdefault("roomName", unit_index[(pid, "room", room_id)])
+        enriched["roomName"] = unit_index[(pid, "room", room_id)]
+    room_unit_key = (pid, "room_unit", room_id, unit_id)
+    if pid and room_id and unit_id and room_unit_key in unit_index:
+        enriched["unitName"] = unit_index[room_unit_key]
+    elif unit_id and not enriched.get("unitName"):
+        enriched["unitName"] = unit_id
     return enriched
 
 
@@ -522,8 +545,9 @@ def _assign_pin(user: dict, hotel: dict, booking: dict, unit_index: dict | None 
             return get_booking_by_pms_id(user["id"], booking_id)
         return existing
 
+    auto = str(hotel.get("pinAssignMode") or "").lower() == "auto"
     match_payload = dict(booking)
-    if str(hotel.get("pinAssignMode") or "").lower() == "auto":
+    if auto:
         match_payload = _refresh_booking_detail(user, match_payload, force=True)
     if _booking_is_inactive(match_payload):
         if existing and existing.get("status") in {"active", "unassigned"}:
@@ -531,20 +555,24 @@ def _assign_pin(user: dict, hotel: dict, booking: dict, unit_index: dict | None 
             return get_booking_by_pms_id(user["id"], booking_id)
         return existing
     booking = dict(match_payload)
+    if auto and not unit_index:
+        try:
+            unit_index = _unit_name_index(_beds24_call(user, beds24.get_properties))
+        except Exception as exc:
+            logger.warning("Property catalog lookup failed before Auto PIN assign: %s", exc)
+            unit_index = {}
     if unit_index:
         booking = _enrich_booking(booking, unit_index)
     guest = _guest_name(booking)
 
-    # Auto matches only labels on the booking JSON, not hotel catalog room names.
-    pick_source = match_payload if str(hotel.get("pinAssignMode") or "").lower() == "auto" else booking
-    space, pick_reason, hint = _pick_space(hotel, pick_source)
+    space, pick_reason, hint = _pick_space(hotel, booking)
     if space is None and not hotel.get("_locksRefreshed"):
         hotel["_locksRefreshed"] = True
         try:
             sync_locks_for_hotel(hotel)
         except Exception as exc:
             logger.warning("Lock refresh before PIN assign failed: %s", exc)
-        space, pick_reason, hint = _pick_space(hotel, pick_source)
+        space, pick_reason, hint = _pick_space(hotel, booking)
     if space is None:
         if pick_reason == "random":
             fail_message = (
@@ -698,7 +726,7 @@ def sync_bookings_for_user(user: dict) -> dict:
         logger.warning("Beds24 fetch failed for %s: %s", user.get("username"), exc)
         return {"ok": False, "error": str(exc)}
 
-    unit_index: dict[tuple[str, str, str], str] = {}
+    unit_index: dict[tuple, str] = {}
     try:
         unit_index = _unit_name_index(_beds24_call(user, beds24.get_properties))
     except Beds24Error as exc:
