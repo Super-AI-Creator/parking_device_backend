@@ -1,4 +1,4 @@
-"""Background PMS booking sync every 1 minute."""
+"""Background PMS booking sync every 3 minutes."""
 
 from datetime import datetime
 import logging
@@ -43,7 +43,7 @@ def start_scheduler() -> None:
         return
     _scheduler.add_job(
         _job,
-        trigger=IntervalTrigger(minutes=1),
+        trigger=IntervalTrigger(minutes=3),
         id="pms_booking_sync",
         replace_existing=True,
         max_instances=1,
@@ -52,4 +52,4 @@ def start_scheduler() -> None:
     )
     _scheduler.start()
     atexit.register(lambda: _scheduler.shutdown(wait=False) if _scheduler.running else None)
-    logger.info("PMS booking sync scheduled every 1 minute")
+    logger.info("PMS booking sync scheduled every 3 minutes")

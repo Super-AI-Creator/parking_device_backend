@@ -46,7 +46,32 @@ def _is_cancelled(booking: dict) -> bool:
     status = booking.get("status")
     if status in (0, "0"):
         return True
+    raw = booking.get("rawPayload")
+    if isinstance(raw, dict) and raw is not booking:
+        if _is_cancelled(raw):
+            return True
     return str(status or "").lower() in {"cancelled", "canceled", "deleted", "no-show", "noshow"}
+
+
+def _departure_date(booking: dict):
+    raw = booking.get("rawPayload") if isinstance(booking.get("rawPayload"), dict) else {}
+    value = str(booking.get("departure") or raw.get("departure") or "")[:10]
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _booking_is_inactive(booking: dict) -> bool:
+    """Cancelled, deleted, or already checked out — must not receive a parking PIN."""
+    if not booking:
+        return False
+    if _is_cancelled(booking):
+        return True
+    day = _departure_date(booking)
+    return bool(day and day < datetime.now(timezone.utc).date())
 
 
 def _ensure_token(user: dict, *, force: bool = False) -> str | None:
@@ -333,18 +358,6 @@ def parking_hints_from_booking(booking: dict) -> list[str]:
         if booking.get(key):
             hints.append(str(booking[key]).strip())
 
-    room_name = str(booking.get("roomName") or booking.get("room_name") or "").strip()
-    unit_label = str(booking.get("unitName") or booking.get("unit_name") or "").strip()
-    if not unit_label:
-        unit_label = str(booking.get("unitId") or "").strip()
-    room_norm = _normalize_park_label(room_name)
-    unit_norm = _normalize_park_label(unit_label)
-    if "park" in room_norm and unit_label:
-        if "park" in unit_norm:
-            hints.append(unit_label)
-        else:
-            hints.append(f"Park {unit_label}")
-
     seen: set[str] = set()
     cleaned: list[str] = []
     for hint in hints:
@@ -369,6 +382,9 @@ def _space_match_score(space: dict, hints: list[str]) -> int:
     for hint in hints:
         hn = _normalize_park_label(hint)
         if not hn:
+            continue
+        # Generic room type "Parking" is not the same as lock "Park 1".
+        if hn in {"park", "parking"} and name not in {"park", "parking"}:
             continue
         if hn == name or hn == lock_id:
             best = max(best, 100)
@@ -442,11 +458,11 @@ def _booking_needs_detail(booking: dict) -> bool:
     return True
 
 
-def _refresh_booking_detail(user: dict, booking: dict) -> dict:
-    """Beds24 list filters often omit room/unit fields; fetch the booking by id when Auto needs them."""
-    if not _booking_needs_detail(booking):
+def _refresh_booking_detail(user: dict, booking: dict, *, force: bool = False) -> dict:
+    """Fetch the live HHS PMS booking. Do not copy catalog room names onto the payload."""
+    if not force and not _booking_needs_detail(booking):
         return booking
-    booking_id = str(booking.get("id") or "")
+    booking_id = str(booking.get("id") or booking.get("bookingId") or "")
     if not booking_id:
         return booking
     try:
@@ -456,11 +472,7 @@ def _refresh_booking_detail(user: dict, booking: dict) -> dict:
         return booking
     if not isinstance(fresh, dict):
         return booking
-    merged = dict(fresh)
-    for key, value in booking.items():
-        if key not in merged or merged.get(key) in (None, "", [], {}):
-            merged[key] = value
-    return merged
+    return fresh
 
 
 def _pick_space(hotel: dict, booking: dict) -> tuple[dict | None, str, str | None]:
@@ -473,7 +485,9 @@ def _pick_space(hotel: dict, booking: dict) -> tuple[dict | None, str, str | Non
         mode = "random"
     hints = parking_hints_from_booking(booking)
     parking_hints = [hint for hint in hints if "park" in _normalize_park_label(hint)]
-    if mode == "auto" and parking_hints:
+    if mode == "auto":
+        if not parking_hints:
+            return None, "Auto mode: booking has no parking info", None
         spaces = list_spaces(hotel_id=hotel["id"])
         match = _match_space(spaces, parking_hints)
         if match is None:
@@ -493,24 +507,44 @@ def _assign_pin(user: dict, hotel: dict, booking: dict, unit_index: dict | None 
     guest = _guest_name(booking)
     existing = get_booking_by_pms_id(user["id"], booking_id)
     if existing and existing.get("status") == "active" and existing.get("parkingSpaceId"):
-        return existing
+        held = get_space(existing["parkingSpaceId"])
+        still_on_lock = held and str(held.get("bookingId") or "") == str(booking_id)
+        if still_on_lock:
+            if _booking_is_inactive(existing) or _booking_is_inactive(booking):
+                _release_pin(user, existing, "cancelled_or_ended")
+                return get_booking_by_pms_id(user["id"], booking_id)
+            return existing
     if hotel.get("blocked"):
         return existing
+    if _booking_is_inactive(booking) or (existing and _booking_is_inactive(existing)):
+        if existing and existing.get("status") in {"active", "unassigned"}:
+            _release_pin(user, existing, "cancelled_or_ended")
+            return get_booking_by_pms_id(user["id"], booking_id)
+        return existing
 
+    match_payload = dict(booking)
     if str(hotel.get("pinAssignMode") or "").lower() == "auto":
-        booking = _refresh_booking_detail(user, booking)
+        match_payload = _refresh_booking_detail(user, match_payload, force=True)
+    if _booking_is_inactive(match_payload):
+        if existing and existing.get("status") in {"active", "unassigned"}:
+            _release_pin(user, existing, "cancelled_or_ended")
+            return get_booking_by_pms_id(user["id"], booking_id)
+        return existing
+    booking = dict(match_payload)
     if unit_index:
         booking = _enrich_booking(booking, unit_index)
     guest = _guest_name(booking)
 
-    space, pick_reason, hint = _pick_space(hotel, booking)
+    # Auto matches only labels on the booking JSON, not hotel catalog room names.
+    pick_source = match_payload if str(hotel.get("pinAssignMode") or "").lower() == "auto" else booking
+    space, pick_reason, hint = _pick_space(hotel, pick_source)
     if space is None and not hotel.get("_locksRefreshed"):
         hotel["_locksRefreshed"] = True
         try:
             sync_locks_for_hotel(hotel)
         except Exception as exc:
             logger.warning("Lock refresh before PIN assign failed: %s", exc)
-        space, pick_reason, hint = _pick_space(hotel, booking)
+        space, pick_reason, hint = _pick_space(hotel, pick_source)
     if space is None:
         if pick_reason == "random":
             fail_message = (
@@ -683,7 +717,7 @@ def sync_bookings_for_user(user: dict) -> dict:
         try:
             if _is_cancelled(booking):
                 existing = get_booking_by_pms_id(user["id"], booking_id)
-                if existing and existing.get("status") == "active":
+                if existing and existing.get("status") in {"active", "unassigned"}:
                     _release_pin(user, existing, "cancelled")
                     released += 1
                 continue
@@ -697,13 +731,15 @@ def sync_bookings_for_user(user: dict) -> dict:
 
     departed_ids = {str(b.get("id")) for b in departed if b.get("id")}
     for row in list_active_bookings_for_owner(user["id"]):
-        if row["bookingId"] in departed_ids:
-            _release_pin(user, row, "departed")
+        if row["bookingId"] in departed_ids or _booking_is_inactive(row):
+            _release_pin(user, row, "departed" if row["bookingId"] in departed_ids else "cancelled_or_ended")
             released += 1
 
     # Retry bookings that were waiting for a free lock (e.g. after Space delete/re-import).
     for row in list_unassigned_bookings_for_owner(user["id"]):
-        if row["bookingId"] in departed_ids:
+        if row["bookingId"] in departed_ids or _booking_is_inactive(row):
+            _release_pin(user, row, "cancelled_or_ended")
+            released += 1
             continue
         hotel = get_hotel(row["hotelId"], include_secrets=True)
         if hotel is None:

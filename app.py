@@ -183,7 +183,7 @@ def _finish_space_free(space: dict, freed_booking_id, hotel_pk, owner_id) -> Non
             _sync_space_keyboard_pin(space, "")
         if not hotel_pk or not owner_id:
             return
-        from booking_sync import _assign_pin, _booking_payload_from_row
+        from booking_sync import _assign_pin, _booking_is_inactive, _booking_payload_from_row
         from models import get_user, list_unassigned_bookings_for_owner
 
         hotel = get_hotel(hotel_pk, include_secrets=True)
@@ -192,6 +192,8 @@ def _finish_space_free(space: dict, freed_booking_id, hotel_pk, owner_id) -> Non
             return
         for waiting in list_unassigned_bookings_for_owner(owner_id, hotel_pk):
             if freed_booking_id and str(waiting.get("bookingId")) == str(freed_booking_id):
+                continue
+            if _booking_is_inactive(waiting):
                 continue
             try:
                 _assign_pin(owner, hotel, _booking_payload_from_row(waiting))
@@ -495,7 +497,7 @@ def update_pms_credentials():
             "user": user,
             "hotels": hotels,
             "count": len(hotels),
-            "message": f"PMS connected. Imported {len(hotels)} hotel(s). Bookings will sync every minute in the background.",
+            "message": f"PMS connected. Imported {len(hotels)} hotel(s). Bookings will sync every 3 minutes in the background.",
         }
     )
 
@@ -604,8 +606,8 @@ def update_hotel_settings(hotel_pk: int):
             "ok": True,
             "hotel": hotel,
             "message": (
-                "Auto mode: PIN goes on the HHS Lock whose name matches the booking parking info. "
-                "Random mode: PIN goes on any free lock."
+                "Auto mode: PIN goes on the HHS Lock whose name matches parking text in the booking. "
+                "If the booking has no parking text, no PIN is created."
                 if (hotel or {}).get("pinAssignMode") == "auto"
                 else "Random mode: PIN goes on any free parking lock."
             ),
@@ -891,6 +893,9 @@ def remove_parking_space(space_id: int):
     if freed_booking_id and space.get("ownerId"):
         booking = get_booking_by_pms_id(space["ownerId"], freed_booking_id)
         if booking and booking.get("status") in ("active", "unassigned"):
+            from booking_sync import _booking_is_inactive
+
+            inactive = _booking_is_inactive(booking)
             upsert_booking(
                 owner_id=space["ownerId"],
                 hotel_id=booking["hotelId"],
@@ -898,8 +903,8 @@ def remove_parking_space(space_id: int):
                 guest_name=booking.get("guestName") or "",
                 arrival=booking.get("arrival"),
                 departure=booking.get("departure"),
-                status="unassigned",
-                pin=booking.get("pin") or pin_from_booking_safe(booking["bookingId"]),
+                status="released" if inactive else "unassigned",
+                pin=None if inactive else (booking.get("pin") or pin_from_booking_safe(booking["bookingId"])),
                 parking_space_id=None,
                 keyboard_pwd_id=None,
             )
