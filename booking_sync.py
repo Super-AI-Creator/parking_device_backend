@@ -67,7 +67,7 @@ def _departure_date(booking: dict):
 def _booking_is_inactive(booking: dict) -> bool:
     """Cancelled, deleted, or already checked out — must not receive a parking PIN."""
     if not booking:
-        return False
+        return True
     if _is_cancelled(booking):
         return True
     day = _departure_date(booking)
@@ -481,8 +481,8 @@ def _booking_needs_detail(booking: dict) -> bool:
     return True
 
 
-def _refresh_booking_detail(user: dict, booking: dict, *, force: bool = False) -> dict:
-    """Fetch the live HHS PMS booking. Do not copy catalog room names onto the payload."""
+def _refresh_booking_detail(user: dict, booking: dict, *, force: bool = False) -> dict | None:
+    """Fetch the live HHS PMS booking. None means it was removed from PMS."""
     if not force and not _booking_needs_detail(booking):
         return booking
     booking_id = str(booking.get("id") or booking.get("bookingId") or "")
@@ -493,8 +493,8 @@ def _refresh_booking_detail(user: dict, booking: dict, *, force: bool = False) -
     except Beds24Error as exc:
         logger.warning("Beds24 booking %s detail fetch failed: %s", booking_id, exc)
         return booking
-    if not isinstance(fresh, dict):
-        return booking
+    if not isinstance(fresh, dict) or not fresh.get("id"):
+        return None
     return fresh
 
 
@@ -533,7 +533,11 @@ def _assign_pin(user: dict, hotel: dict, booking: dict, unit_index: dict | None 
         held = get_space(existing["parkingSpaceId"])
         still_on_lock = held and str(held.get("bookingId") or "") == str(booking_id)
         if still_on_lock:
-            if _booking_is_inactive(existing) or _booking_is_inactive(booking):
+            live = _refresh_booking_detail(user, dict(booking), force=True)
+            if live is None:
+                _release_pin(user, existing, "deleted")
+                return get_booking_by_pms_id(user["id"], booking_id)
+            if _booking_is_inactive(existing) or _booking_is_inactive(live) or _booking_is_inactive(booking):
                 _release_pin(user, existing, "cancelled_or_ended")
                 return get_booking_by_pms_id(user["id"], booking_id)
             return existing
@@ -546,9 +550,11 @@ def _assign_pin(user: dict, hotel: dict, booking: dict, unit_index: dict | None 
         return existing
 
     auto = str(hotel.get("pinAssignMode") or "").lower() == "auto"
-    match_payload = dict(booking)
-    if auto:
-        match_payload = _refresh_booking_detail(user, match_payload, force=True)
+    match_payload = _refresh_booking_detail(user, dict(booking), force=True)
+    if match_payload is None:
+        if existing and existing.get("status") in {"active", "unassigned"}:
+            _release_pin(user, existing, "deleted")
+        return get_booking_by_pms_id(user["id"], booking_id)
     if _booking_is_inactive(match_payload):
         if existing and existing.get("status") in {"active", "unassigned"}:
             _release_pin(user, existing, "cancelled_or_ended")
@@ -713,6 +719,18 @@ def _hotel_for_booking(user: dict, booking: dict) -> dict | None:
     return get_hotel_by_public_id(property_id, user["id"], include_secrets=True)
 
 
+def _fetch_pms_booking(user: dict, booking_id: str) -> tuple[str, dict | None]:
+    """Look up one booking in HHS PMS. missing = deleted/removed, not an API outage."""
+    try:
+        live = _beds24_call(user, beds24.get_booking, str(booking_id))
+    except Beds24Error as exc:
+        logger.warning("PMS booking lookup failed for %s: %s", booking_id, exc)
+        return "error", None
+    if isinstance(live, dict) and live.get("id"):
+        return "found", live
+    return "missing", None
+
+
 def sync_bookings_for_user(user: dict) -> dict:
     assigned = 0
     released = 0
@@ -733,6 +751,7 @@ def sync_bookings_for_user(user: dict) -> dict:
         logger.warning("Beds24 property lookup failed for %s: %s", user.get("username"), exc)
 
     seen_ids = set()
+    verified_ids = set()
     for booking in list(new_bookings) + list(modified):
         booking = _enrich_booking(booking, unit_index)
         booking_id = str(booking.get("id") or "")
@@ -743,31 +762,55 @@ def sync_bookings_for_user(user: dict) -> dict:
         if hotel is None:
             continue
         try:
-            if _is_cancelled(booking):
+            if _booking_is_inactive(booking):
                 existing = get_booking_by_pms_id(user["id"], booking_id)
                 if existing and existing.get("status") in {"active", "unassigned"}:
                     _release_pin(user, existing, "cancelled")
                     released += 1
+                verified_ids.add(booking_id)
                 continue
             if hotel.get("blocked"):
                 continue
             _assign_pin(user, hotel, booking, unit_index)
             assigned += 1
+            verified_ids.add(booking_id)
         except Exception as exc:
             errors += 1
             logger.exception("Booking sync failed for %s: %s", booking_id, exc)
 
     departed_ids = {str(b.get("id")) for b in departed if b.get("id")}
     for row in list_active_bookings_for_owner(user["id"]):
-        if row["bookingId"] in departed_ids or _booking_is_inactive(row):
-            _release_pin(user, row, "departed" if row["bookingId"] in departed_ids else "cancelled_or_ended")
+        booking_id = str(row["bookingId"])
+        reason = None
+        if booking_id in departed_ids:
+            reason = "departed"
+        elif _booking_is_inactive(row):
+            reason = "cancelled_or_ended"
+        elif booking_id not in verified_ids:
+            status, live = _fetch_pms_booking(user, booking_id)
+            if status == "missing":
+                reason = "deleted"
+            elif status == "found" and (_is_cancelled(live) or _booking_is_inactive(live)):
+                reason = "cancelled_or_ended"
+        if reason:
+            _release_pin(user, row, reason)
             released += 1
 
     # Retry bookings that were waiting for a free lock (e.g. after Space delete/re-import).
     for row in list_unassigned_bookings_for_owner(user["id"]):
-        if row["bookingId"] in departed_ids or _booking_is_inactive(row):
+        booking_id = str(row.get("bookingId") or "")
+        if booking_id in departed_ids or _booking_is_inactive(row):
             _release_pin(user, row, "cancelled_or_ended")
             released += 1
+            continue
+        status, live = _fetch_pms_booking(user, booking_id)
+        if status == "missing" or (
+            status == "found" and (_is_cancelled(live) or _booking_is_inactive(live))
+        ):
+            _release_pin(user, row, "deleted" if status == "missing" else "cancelled_or_ended")
+            released += 1
+            continue
+        if status == "error":
             continue
         hotel = get_hotel(row["hotelId"], include_secrets=True)
         if hotel is None:
@@ -776,7 +819,7 @@ def sync_bookings_for_user(user: dict) -> dict:
             continue
         try:
             before = row.get("parkingSpaceId")
-            payload = _enrich_booking(_booking_payload_from_row(row), unit_index)
+            payload = _enrich_booking(live or _booking_payload_from_row(row), unit_index)
             saved = _assign_pin(user, hotel, payload, unit_index)
             if saved and saved.get("parkingSpaceId") and saved.get("parkingSpaceId") != before:
                 assigned += 1
